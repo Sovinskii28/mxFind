@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+
+# Local runtime data
+*.sqlite
+*.sqlite3
+*.db
+
+# Local configuration and secrets
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
