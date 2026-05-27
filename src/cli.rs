@@ -27,6 +27,10 @@ pub enum Command {
         /// TOML config path with homeservers to index.
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Print skipped homeservers and reasons.
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Show details for one indexed room.

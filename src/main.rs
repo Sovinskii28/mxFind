@@ -15,7 +15,7 @@ use crate::banner::print_banner;
 use crate::cli::{Cli, Command};
 use crate::config::load_config;
 use crate::db::{default_db_path, find_room, init_db, open_db, search_rooms, upsert_rooms};
-use crate::matrix::fetch_public_rooms;
+use crate::matrix::{fetch_public_rooms, PublicRoomsError};
 use crate::models::Room;
 use crate::output::{print_room_card, print_room_json, print_rooms, print_rooms_json};
 use crate::search::{dedup_rooms, filter_rooms};
@@ -31,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
             println!("Run `mxfind --help` to see available commands.");
         }
 
-        Some(Command::Index { db, config }) => {
+        Some(Command::Index {
+            db,
+            config,
+            verbose,
+        }) => {
             let config = load_config(config.as_deref())?;
             let db_path = match db {
                 Some(path) => path,
@@ -41,17 +45,46 @@ async fn main() -> anyhow::Result<()> {
             let pool = open_db(&db_path).await?;
             init_db(&pool).await?;
 
-            let servers_scanned = config.servers.len();
-            let (rooms, servers_failed) = fetch_rooms_from_servers(config.servers).await;
+            println!("Indexing public rooms...");
+            println!();
+
+            let index_result = fetch_rooms_from_servers(config.servers).await;
+            if verbose {
+                for skipped in &index_result.skipped_servers {
+                    println!("Skipped: {} ({})", skipped.server, skipped.reason);
+                }
+
+                if !index_result.skipped_servers.is_empty() {
+                    println!();
+                }
+            }
+
+            if index_result.servers_scanned > 0 && index_result.servers_available == 0 {
+                if verbose {
+                    anyhow::bail!("No homeservers returned public rooms.");
+                } else {
+                    anyhow::bail!(
+                        "No homeservers returned public rooms. Run `mxfind index --verbose` for details."
+                    );
+                }
+            }
+
+            let servers_scanned = index_result.servers_scanned;
+            let servers_available = index_result.servers_available;
+            let servers_skipped = index_result.skipped_servers.len();
+            let rooms = index_result.rooms;
             let rooms_fetched = rooms.len();
             let rooms = dedup_rooms(rooms);
             let rooms_saved = upsert_rooms(&pool, &rooms).await?;
 
             println!("Servers scanned: {servers_scanned}");
-            println!("Servers failed: {servers_failed}");
+            println!("Servers available: {servers_available}");
+            println!("Servers skipped: {servers_skipped}");
             println!("Rooms fetched: {rooms_fetched}");
             println!("Rooms saved: {rooms_saved}");
             println!("Database path: {}", db_path.display());
+            println!();
+            println!("Done.");
         }
 
         Some(Command::Room {
@@ -152,7 +185,8 @@ async fn search_live_rooms(
     query: &str,
 ) -> anyhow::Result<Vec<Room>> {
     let config = load_config(config_path)?;
-    let (rooms, _) = fetch_rooms_from_servers(config.servers).await;
+    let index_result = fetch_rooms_from_servers(config.servers).await;
+    let rooms = index_result.rooms;
     let rooms = dedup_rooms(rooms);
 
     Ok(filter_rooms(query, &rooms))
@@ -168,9 +202,23 @@ fn print_search_results(rooms: &[Room], limit: usize, json: bool) -> anyhow::Res
     }
 }
 
-async fn fetch_rooms_from_servers(servers: Vec<String>) -> (Vec<Room>, usize) {
+struct FetchRoomsResult {
+    rooms: Vec<Room>,
+    servers_scanned: usize,
+    servers_available: usize,
+    skipped_servers: Vec<SkippedServer>,
+}
+
+struct SkippedServer {
+    server: String,
+    reason: PublicRoomsError,
+}
+
+async fn fetch_rooms_from_servers(servers: Vec<String>) -> FetchRoomsResult {
     let mut rooms: Vec<Room> = Vec::new();
-    let mut servers_failed = 0;
+    let mut servers_available = 0;
+    let mut skipped_servers = Vec::new();
+    let servers_scanned = servers.len();
     let requests = servers.into_iter().map(|server| async move {
         let result = fetch_public_rooms(&server).await;
         (server, result)
@@ -178,13 +226,18 @@ async fn fetch_rooms_from_servers(servers: Vec<String>) -> (Vec<Room>, usize) {
 
     for (server, result) in join_all(requests).await {
         match result {
-            Ok(mut server_rooms) => rooms.append(&mut server_rooms),
-            Err(error) => {
-                servers_failed += 1;
-                eprintln!("warning: failed to fetch rooms from {server}: {error:#}");
+            Ok(mut server_rooms) => {
+                servers_available += 1;
+                rooms.append(&mut server_rooms);
             }
+            Err(reason) => skipped_servers.push(SkippedServer { server, reason }),
         }
     }
 
-    (rooms, servers_failed)
+    FetchRoomsResult {
+        rooms,
+        servers_scanned,
+        servers_available,
+        skipped_servers,
+    }
 }

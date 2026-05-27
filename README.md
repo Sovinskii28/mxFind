@@ -2,34 +2,82 @@
 
 English | [Русский](README.ru.md)
 
-`mxfind` — Rust CLI/TUI tool for discovering public Matrix rooms through homeserver public room directories.
+```text
+ __  __ __  __ _____ ___ _   _ ____
+|  \/  |\ \/ /|  ___|_ _| \ | |  _ \
+| |\/| | \  / | |_   | ||  \| | | | |
+| |  | | /  \ |  _|  | || |\  | |_| |
+|_|  |_|/_/\_\|_|   |___|_| \_|____/
+```
+
+**Matrix Federation Explorer**
+
+`mxfind` is a Rust CLI/TUI tool for discovering public Matrix rooms through homeserver public room directories.
+
+It can build a local SQLite index, search it quickly, inspect rooms, print compact terminal output, and emit full JSON for scripts.
 
 ## Table of Contents
 
 - [Features](#features)
-- [Screenshots](#screenshots)
+- [How It Works](#how-it-works)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Commands](#commands)
-- [Example Usage](#example-usage)
+- [Output](#output)
 - [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Limitations](#limitations)
-- [Roadmap](#roadmap)
+- [Database](#database)
+- [TUI](#tui)
+- [Matrix Federation Limits](#matrix-federation-limits)
+- [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Roadmap](#roadmap)
 - [License](#license)
 
 ## Features
 
-- Matrix public room search through the Client-Server `publicRooms` API
-- Multi-server search across configured homeservers
-- SQLite local index for fast offline/local queries
-- Room details lookup by room ID or canonical alias
-- JSON output for scripting and automation
-- Experimental terminal UI
-- Async networking with Tokio and Reqwest
+- Search public Matrix rooms through `/_matrix/client/v3/publicRooms`.
+- Query multiple configured homeservers.
+- Store room metadata in a local SQLite index.
+- Use local search by default when the database exists.
+- Force live search when needed.
+- Print compact human-readable search results.
+- Print full JSON without truncating data.
+- Inspect a single indexed room by room ID or canonical alias.
+- Explore the local index through an experimental TUI.
+- Async networking with Tokio and Reqwest.
+
+## How It Works
+
+Matrix does not provide a single global public room search endpoint for the entire federation. Homeservers may expose their own public room directories.
+
+`mxfind` supports two search paths:
+
+1. **Local search** queries the SQLite database created by `mxfind index`.
+2. **Live search** requests configured homeservers and filters the returned rooms in memory.
+
+The recommended workflow is:
+
+```sh
+mxfind index
+mxfind search rust
+```
+
+This keeps repeated searches fast and avoids a network request on every query.
 
 ## Installation
+
+### Requirements
+
+- Rust toolchain
+- Cargo
+- Network access for indexing and live search
+
+Check your toolchain:
+
+```sh
+rustc --version
+cargo --version
+```
 
 ### Build from Source
 
@@ -39,115 +87,168 @@ cd mxfind
 cargo build --release
 ```
 
-The binary will be available at:
+The release binary will be available at:
 
 ```sh
 ./target/release/mxfind
 ```
 
-### Cargo Install
-
-TODO: publish `mxfind` to crates.io.
-
-For local development, install from the repository:
+### Install Locally
 
 ```sh
 cargo install --path .
 ```
 
-### Release Binaries
+### Run Without Installing
 
-TODO: provide prebuilt release binaries.
+```sh
+cargo run -- search rust
+cargo run -- index
+```
 
 ## Quick Start
 
-The normal workflow is:
-
-1. Build or refresh the local SQLite index.
-2. Search the local index.
-3. Inspect a room.
-4. Optionally open the experimental TUI.
+Build or refresh the local index:
 
 ```sh
 mxfind index
-mxfind search rust
-mxfind room '#rust:matrix.org'
-mxfind tui
 ```
 
-Run `mxfind index` first. It queries the configured homeservers and stores public room metadata in a local SQLite database.
+Search rooms:
 
-The TUI uses the local SQLite database too, so it also expects `mxfind index` to have been run.
+```sh
+mxfind search rust
+```
 
-Default database path:
+Inspect a room:
 
-```text
-~/.local/share/mxfind/mxfind.sqlite
+```sh
+mxfind room '#rust:matrix.org'
+```
+
+Open the TUI:
+
+```sh
+mxfind tui
 ```
 
 ## Commands
 
-| Command | Purpose | Common Options |
-| --- | --- | --- |
-| `mxfind search <query>` | Search rooms. Uses the local DB if it exists, otherwise falls back to live search. | `--local`, `--live`, `--json`, `--limit <n>`, `--db <path>`, `--config <path>` |
-| `mxfind index` | Fetch public rooms from configured homeservers and store them in SQLite. | `--db <path>`, `--config <path>` |
-| `mxfind room <identifier>` | Show details for one indexed room by room ID or canonical alias. | `--json`, `--db <path>` |
-| `mxfind tui` | Open the experimental terminal UI backed by the local SQLite index. | `--db <path>` |
+### `mxfind`
 
-## Example Usage
+Prints the banner, version, and a short hint.
 
-Build the local index:
+```sh
+mxfind
+```
+
+### `mxfind index`
+
+Fetch public rooms from configured homeservers and store them in SQLite.
 
 ```sh
 mxfind index
 ```
 
-Search using the default behavior:
+Options:
+
+| Option | Purpose |
+| --- | --- |
+| `--db <path>` | Use a custom SQLite database path. |
+| `--config <path>` | Use a custom TOML config path. |
+| `-v, --verbose` | Print skipped homeservers and reasons. |
+
+### `mxfind search <query>`
+
+Search by `room_id`, `canonical_alias`, `name`, and `topic`.
 
 ```sh
 mxfind search rust
 ```
 
-Force live search against homeserver public directories:
+Options:
+
+| Option | Purpose |
+| --- | --- |
+| `-l, --limit <n>` | Maximum number of results. Default: `20`. |
+| `--json` | Print full JSON without truncating topic. |
+| `--local` | Force local SQLite search. |
+| `--live` | Force live search through homeserver public directories. |
+| `--db <path>` | Use a custom SQLite database path. |
+| `--config <path>` | Use a custom config for live search. |
+
+Examples:
 
 ```sh
-mxfind search rust --live
+mxfind search linux --limit 5
+mxfind search matrix --local
+mxfind search rust --live --config config.toml
+mxfind search security --json
 ```
 
-Force local SQLite search:
+`--local` and `--live` cannot be used together.
+
+### `mxfind room <identifier>`
+
+Show one indexed room by room ID or canonical alias.
 
 ```sh
-mxfind search linux --local --limit 5
+mxfind room '#rust:matrix.org'
+mxfind room '!abcdef:matrix.org' --json
 ```
 
-Print search results as JSON:
+Options:
+
+| Option | Purpose |
+| --- | --- |
+| `--json` | Print the room as JSON. |
+| `--db <path>` | Use a custom SQLite database path. |
+
+Room details keep the full topic.
+
+### `mxfind tui`
+
+Open the experimental terminal UI backed by the local SQLite index.
+
+```sh
+mxfind tui
+```
+
+Options:
+
+| Option | Purpose |
+| --- | --- |
+| `--db <path>` | Use a custom SQLite database path. |
+
+Run `mxfind index` before opening the TUI.
+
+## Output
+
+Human-readable search output is compact:
+
+```text
+Searching for: rust
+Found 2 matching rooms
+[1] #rust:matrix.org
+    Name:    Rust
+    Members: 12000
+    Server:  matrix.org
+    Topic:   Rust programming language community
+    Link:    https://matrix.to/#/#rust:matrix.org
+```
+
+For search output, `topic` is normalized to one line and truncated to a short preview. `name`, `room_id`, and `canonical_alias` are not truncated.
+
+JSON output keeps full data:
 
 ```sh
 mxfind search rust --json
 ```
 
-Use a custom config:
+Example with `jq`:
 
 ```sh
-mxfind search rust --config config.toml
-```
-
-Inspect one room from the local index:
-
-```sh
-mxfind room '#rust:matrix.org'
-```
-
-Print one room as JSON:
-
-```sh
-mxfind room '#rust:matrix.org' --json
-```
-
-Open the experimental TUI:
-
-```sh
-mxfind tui
+mxfind search rust --json | jq '.[].canonical_alias'
 ```
 
 ## Configuration
@@ -161,70 +262,149 @@ Default config path:
 Example:
 
 ```toml
-servers = ["matrix.org", "envs.net"]
+servers = ["matrix.org", "envs.net", "tchncs.de"]
 ```
 
-If no config file exists, `mxfind` uses its built-in default homeserver list.
-
-You can also pass a config file explicitly:
+Pass a config explicitly:
 
 ```sh
 mxfind index --config config.toml
 mxfind search rust --live --config config.toml
 ```
 
-## Architecture
+If no config exists, `mxfind` uses its built-in default server list.
 
-`mxfind` has two search paths:
+## Database
 
-- **Live search** queries selected homeservers directly via the Matrix Client-Server `/_matrix/client/v3/publicRooms` endpoint.
-- **Local search** queries a SQLite index created by `mxfind index`.
+Default database path:
 
-The index command fetches public room directories from configured homeservers, deduplicates rooms, and upserts them into SQLite.
+```text
+~/.local/share/mxfind/mxfind.sqlite
+```
 
-The TUI is intentionally local-only. It searches the SQLite index and does not perform network requests.
+Override it:
 
-## Limitations
+```sh
+mxfind index --db ./mxfind.sqlite
+mxfind search rust --db ./mxfind.sqlite
+mxfind room '#rust:matrix.org' --db ./mxfind.sqlite
+mxfind tui --db ./mxfind.sqlite
+```
 
-Matrix does not provide one global public room search endpoint for the whole federation.
+Stored room metadata includes:
 
-`mxfind` searches public room directories exposed by selected homeservers. That means results depend on which servers are configured and what those servers choose to expose.
+- room ID;
+- canonical alias;
+- name;
+- topic;
+- joined member count;
+- source homeserver;
+- discovery timestamp;
+- last seen timestamp.
 
-Some homeservers may:
+Data is not truncated before being saved to SQLite.
 
-- not respond
-- time out
-- disable or restrict their public directory
-- require authentication for directory access
+## TUI
 
-Private rooms are not indexed. Rooms not returned by a queried public directory are not visible to `mxfind`.
+The TUI is local-only and does not perform network requests.
 
-## Roadmap
+Keys:
 
-- Better TUI
-- Federation analytics
-- Room statistics
-- Caching improvements
-- Incremental indexing
-- Full-text search
-- Tags/categories
+| Key | Action |
+| --- | --- |
+| Text input | Edit the search query. |
+| `Enter` | Run search. |
+| `Up` / `Down` | Move through results or scroll details. |
+| `Left` / `Right` | Switch focused panel. |
+| `PageUp` / `PageDown` | Scroll details faster. |
+| `Esc` | Quit. |
+| `q` | Quit when the query is empty. |
+
+## Matrix Federation Limits
+
+`mxfind` is an explorer for reachable public directories, not a complete map of Matrix.
+
+- There is no single global federation-wide public room endpoint.
+- Results depend on configured homeservers.
+- Some homeservers disable or restrict their public directory.
+- Some homeservers time out or return errors.
+- Private rooms are not indexed.
+
+## Troubleshooting
+
+### `Local database not found. Run mxfind index first.`
+
+Create the database:
+
+```sh
+mxfind index
+```
+
+Or pass an existing database:
+
+```sh
+mxfind search rust --local --db ./mxfind.sqlite
+```
+
+### Some servers fail during indexing
+
+This is expected in Matrix federation. `mxfind index` keeps going and reports the number of failed servers.
+
+### Live search returns too few results
+
+Live search depends on the configured server list. Add more homeservers to your config:
+
+```toml
+servers = ["matrix.org", "envs.net", "tchncs.de", "kde.org", "gnome.org"]
+```
 
 ## Development
 
+Checks:
+
 ```sh
-cargo fmt
+cargo fmt --check
 cargo clippy
 cargo test
 ```
 
-Useful local checks:
+Manual checks:
 
 ```sh
-cargo check
+cargo run
+cargo run -- --help
 cargo run -- index
-cargo run -- search rust
+cargo run -- search rust --limit 5
+cargo run -- search rust --json
+cargo run -- room '#rust:matrix.org'
 cargo run -- tui
 ```
+
+Main modules:
+
+| File | Purpose |
+| --- | --- |
+| `src/main.rs` | Entrypoint and command routing. |
+| `src/cli.rs` | Clap command and option definitions. |
+| `src/banner.rs` | CLI banner and branding. |
+| `src/config.rs` | TOML config loading and default servers. |
+| `src/matrix.rs` | Matrix Client-Server API requests. |
+| `src/db.rs` | SQLite schema, upsert, local search, and room lookup. |
+| `src/search.rs` | Room filtering and deduplication. |
+| `src/output.rs` | Human output, JSON output, and topic preview. |
+| `src/tui.rs` | Experimental terminal UI. |
+| `src/models.rs` | Shared data models. |
+
+## Roadmap
+
+- SQLite FTS5 full-text search.
+- Filters such as `--server`, `--min-members`, and `--has-alias`.
+- `stats` command.
+- Incremental indexing and pruning stale rooms.
+- CSV export.
+- Bookmarks and user tags.
+- Better TUI with search-as-you-type.
+- Homeserver health checks.
 
 ## License
 

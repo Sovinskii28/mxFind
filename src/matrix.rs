@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Context;
+use reqwest::StatusCode;
 use serde::Deserialize;
 
 use crate::models::Room;
@@ -19,23 +19,78 @@ struct PublicRoom {
     num_joined_members: Option<u64>,
 }
 
-pub async fn fetch_public_rooms(server: &str) -> anyhow::Result<Vec<Room>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicRoomsErrorKind {
+    NotFound,
+    Unauthorized,
+    Timeout,
+    NetworkError,
+    InvalidResponse,
+}
+
+#[derive(Debug)]
+pub struct PublicRoomsError {
+    kind: PublicRoomsErrorKind,
+    detail: String,
+}
+
+impl PublicRoomsError {
+    fn new(kind: PublicRoomsErrorKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PublicRoomsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            PublicRoomsErrorKind::NotFound | PublicRoomsErrorKind::Unauthorized => {
+                formatter.write_str(&self.detail)
+            }
+            PublicRoomsErrorKind::Timeout => formatter.write_str("timeout"),
+            PublicRoomsErrorKind::NetworkError => {
+                write!(formatter, "network error: {}", self.detail)
+            }
+            PublicRoomsErrorKind::InvalidResponse => {
+                write!(formatter, "invalid response: {}", self.detail)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PublicRoomsError {}
+
+pub async fn fetch_public_rooms(server: &str) -> Result<Vec<Room>, PublicRoomsError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .context("failed to build HTTP client")?;
+        .map_err(|error| {
+            PublicRoomsError::new(
+                PublicRoomsErrorKind::NetworkError,
+                format!("failed to build HTTP client: {error}"),
+            )
+        })?;
 
     let url = format!("https://{server}/_matrix/client/v3/publicRooms");
     let response = client
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("failed to request public rooms from {server}"))?
-        .error_for_status()
-        .with_context(|| format!("public rooms request failed for {server}"))?
+        .map_err(classify_request_error)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(classify_http_status(status));
+    }
+
+    let response = response
         .json::<PublicRoomsResponse>()
         .await
-        .with_context(|| format!("failed to parse public rooms response from {server}"))?;
+        .map_err(|error| {
+            PublicRoomsError::new(PublicRoomsErrorKind::InvalidResponse, error.to_string())
+        })?;
 
     let rooms = response
         .chunk
@@ -51,4 +106,22 @@ pub async fn fetch_public_rooms(server: &str) -> anyhow::Result<Vec<Room>> {
         .collect();
 
     Ok(rooms)
+}
+
+fn classify_request_error(error: reqwest::Error) -> PublicRoomsError {
+    if error.is_timeout() {
+        PublicRoomsError::new(PublicRoomsErrorKind::Timeout, "request timed out")
+    } else {
+        PublicRoomsError::new(PublicRoomsErrorKind::NetworkError, error.to_string())
+    }
+}
+
+fn classify_http_status(status: StatusCode) -> PublicRoomsError {
+    let kind = match status {
+        StatusCode::NOT_FOUND => PublicRoomsErrorKind::NotFound,
+        StatusCode::UNAUTHORIZED => PublicRoomsErrorKind::Unauthorized,
+        _ => PublicRoomsErrorKind::NetworkError,
+    };
+
+    PublicRoomsError::new(kind, status.to_string())
 }
