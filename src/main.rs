@@ -9,13 +9,13 @@ mod search;
 mod tui;
 
 use clap::Parser;
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::banner::print_banner;
 use crate::cli::{Cli, Command};
 use crate::config::load_config;
 use crate::db::{default_db_path, find_room, init_db, open_db, search_rooms, upsert_rooms};
-use crate::matrix::{fetch_public_rooms, PublicRoomsError};
+use crate::matrix::fetch_public_rooms;
 use crate::models::Room;
 use crate::output::{print_room_card, print_room_json, print_rooms, print_rooms_json};
 use crate::search::{dedup_rooms, filter_rooms};
@@ -48,16 +48,9 @@ async fn main() -> anyhow::Result<()> {
             println!("Indexing public rooms...");
             println!();
 
-            let index_result = fetch_rooms_from_servers(config.servers).await;
-            if verbose {
-                for skipped in &index_result.skipped_servers {
-                    println!("Skipped: {} ({})", skipped.server, skipped.reason);
-                }
-
-                if !index_result.skipped_servers.is_empty() {
-                    println!();
-                }
-            }
+            let index_result =
+                fetch_rooms_from_servers(config.servers, Some(IndexProgress { verbose })).await;
+            println!();
 
             if index_result.servers_scanned > 0 && index_result.servers_available == 0 {
                 if verbose {
@@ -71,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
             let servers_scanned = index_result.servers_scanned;
             let servers_available = index_result.servers_available;
-            let servers_skipped = index_result.skipped_servers.len();
+            let servers_skipped = index_result.servers_skipped;
             let rooms = index_result.rooms;
             let rooms_fetched = rooms.len();
             let rooms = dedup_rooms(rooms);
@@ -185,7 +178,7 @@ async fn search_live_rooms(
     query: &str,
 ) -> anyhow::Result<Vec<Room>> {
     let config = load_config(config_path)?;
-    let index_result = fetch_rooms_from_servers(config.servers).await;
+    let index_result = fetch_rooms_from_servers(config.servers, None).await;
     let rooms = index_result.rooms;
     let rooms = dedup_rooms(rooms);
 
@@ -206,31 +199,60 @@ struct FetchRoomsResult {
     rooms: Vec<Room>,
     servers_scanned: usize,
     servers_available: usize,
-    skipped_servers: Vec<SkippedServer>,
+    servers_skipped: usize,
 }
 
-struct SkippedServer {
-    server: String,
-    reason: PublicRoomsError,
+#[derive(Clone, Copy)]
+struct IndexProgress {
+    verbose: bool,
 }
 
-async fn fetch_rooms_from_servers(servers: Vec<String>) -> FetchRoomsResult {
+async fn fetch_rooms_from_servers(
+    servers: Vec<String>,
+    progress: Option<IndexProgress>,
+) -> FetchRoomsResult {
     let mut rooms: Vec<Room> = Vec::new();
     let mut servers_available = 0;
-    let mut skipped_servers = Vec::new();
+    let mut servers_skipped = 0;
     let servers_scanned = servers.len();
-    let requests = servers.into_iter().map(|server| async move {
-        let result = fetch_public_rooms(&server).await;
-        (server, result)
-    });
+    let mut requests = FuturesUnordered::new();
 
-    for (server, result) in join_all(requests).await {
+    for server in servers {
+        requests.push(async move {
+            let result = fetch_public_rooms(&server).await;
+            (server, result)
+        });
+    }
+
+    let mut servers_completed = 0;
+
+    while let Some((server, result)) = requests.next().await {
+        servers_completed += 1;
+
         match result {
             Ok(mut server_rooms) => {
                 servers_available += 1;
+                let rooms_count = server_rooms.len();
+                if progress.is_some() {
+                    println!(
+                        "[{servers_completed}/{servers_scanned}] {server} ... ok, {rooms_count} rooms"
+                    );
+                }
                 rooms.append(&mut server_rooms);
             }
-            Err(reason) => skipped_servers.push(SkippedServer { server, reason }),
+            Err(reason) => {
+                servers_skipped += 1;
+
+                if let Some(progress) = progress {
+                    if progress.verbose {
+                        println!(
+                            "[{servers_completed}/{servers_scanned}] {server} ... skipped ({reason})"
+                        );
+                    } else {
+                        println!("[{servers_completed}/{servers_scanned}] {server} ... skipped");
+                    }
+                }
+            }
         }
     }
 
@@ -238,6 +260,6 @@ async fn fetch_rooms_from_servers(servers: Vec<String>) -> FetchRoomsResult {
         rooms,
         servers_scanned,
         servers_available,
-        skipped_servers,
+        servers_skipped,
     }
 }
