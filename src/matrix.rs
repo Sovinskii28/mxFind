@@ -1,13 +1,23 @@
 use std::time::Duration;
 
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::models::Room;
+
+const PUBLIC_ROOMS_PAGE_LIMIT: u64 = 100;
 
 #[derive(Deserialize)]
 struct PublicRoomsResponse {
     chunk: Vec<PublicRoom>,
+    next_batch: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PublicRoomsQuery<'a> {
+    limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -74,36 +84,49 @@ pub async fn fetch_public_rooms(server: &str) -> Result<Vec<Room>, PublicRoomsEr
         })?;
 
     let url = format!("https://{server}/_matrix/client/v3/publicRooms");
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(classify_request_error)?;
+    let mut rooms = Vec::new();
+    let mut next_batch = None;
 
-    let status = response.status();
-    if !status.is_success() {
-        return Err(classify_http_status(status));
-    }
+    loop {
+        let query = PublicRoomsQuery {
+            limit: PUBLIC_ROOMS_PAGE_LIMIT,
+            since: next_batch.as_deref(),
+        };
 
-    let response = response
-        .json::<PublicRoomsResponse>()
-        .await
-        .map_err(|error| {
-            PublicRoomsError::new(PublicRoomsErrorKind::InvalidResponse, error.to_string())
-        })?;
+        let response = client
+            .get(&url)
+            .query(&query)
+            .send()
+            .await
+            .map_err(classify_request_error)?;
 
-    let rooms = response
-        .chunk
-        .into_iter()
-        .map(|room| Room {
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_http_status(status));
+        }
+
+        let response = response
+            .json::<PublicRoomsResponse>()
+            .await
+            .map_err(|error| {
+                PublicRoomsError::new(PublicRoomsErrorKind::InvalidResponse, error.to_string())
+            })?;
+
+        rooms.extend(response.chunk.into_iter().map(|room| Room {
             room_id: room.room_id,
             name: room.name,
             topic: room.topic,
             canonical_alias: room.canonical_alias,
             num_joined_members: room.num_joined_members,
             server: server.to_string(),
-        })
-        .collect();
+        }));
+
+        let Some(batch) = response.next_batch else {
+            break;
+        };
+
+        next_batch = Some(batch);
+    }
 
     Ok(rooms)
 }

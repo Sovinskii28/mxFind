@@ -20,16 +20,9 @@ impl Default for Config {
 pub fn default_servers() -> Vec<String> {
     vec![
         "matrix.org".to_string(),
-        "envs.net".to_string(),
         "tchncs.de".to_string(),
-        "kde.org".to_string(),
-        "gnome.org".to_string(),
-        "gitter.im".to_string(),
-        "tchncs.de".to_string(),
-        "feline.support".to_string(),
         "midov.pl".to_string(),
-        "nitro.chat".to_string(),
-        "continuwuity.org".to_string(),
+        "matrix.tchncs.de".to_string(),
     ]
 }
 

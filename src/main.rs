@@ -211,6 +211,11 @@ async fn fetch_rooms_from_servers(
     servers: Vec<String>,
     progress: Option<IndexProgress>,
 ) -> FetchRoomsResult {
+    let servers: Vec<String> = servers
+        .into_iter()
+        .map(|server| server.trim().to_string())
+        .filter(|server| !server.is_empty())
+        .collect();
     let mut rooms: Vec<Room> = Vec::new();
     let mut servers_available = 0;
     let mut servers_skipped = 0;
