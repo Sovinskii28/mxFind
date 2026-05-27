@@ -29,6 +29,7 @@ pub fn default_servers() -> Vec<String> {
         "feline.support".to_string(),
         "midov.pl".to_string(),
         "nitro.chat".to_string(),
+        "continuwuity.org".to_string(),
     ]
 }
 

@@ -9,7 +9,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use sqlx::SqlitePool;
 
@@ -21,6 +21,9 @@ const TUI_RESULT_LIMIT: usize = 50;
 pub struct AppState {
     pub query: String,
     pub selected: usize,
+    results_offset: usize,
+    details_scroll: u16,
+    focused_panel: FocusedPanel,
     pub should_quit: bool,
     results: Vec<Room>,
     has_searched: bool,
@@ -32,12 +35,21 @@ impl AppState {
         Self {
             query: String::new(),
             selected: 0,
+            results_offset: 0,
+            details_scroll: 0,
+            focused_panel: FocusedPanel::Results,
             should_quit: false,
             results: Vec::new(),
             has_searched: false,
             message: None,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusedPanel {
+    Results,
+    Details,
 }
 
 pub async fn run(pool: SqlitePool) -> anyhow::Result<()> {
@@ -80,16 +92,21 @@ async fn run_loop(
                     Constraint::Min(0),
                 ])
                 .split(area);
-            let title = Paragraph::new("mxfind TUI")
+            let title = Paragraph::new("mxFind")
                 .alignment(Alignment::Center)
                 .block(Block::default().borders(Borders::ALL));
             let search = Paragraph::new(format!("Search: {}", state.query))
                 .block(Block::default().borders(Borders::ALL));
             let help_text = match &state.message {
                 Some(message) => {
-                    format!("Type to search | Enter search | ↑/↓ select | Esc quit | {message}")
+                    format!(
+                        "Type to search | Enter search | ←/→ panel | ↑/↓ scroll | Esc quit | {message}"
+                    )
                 }
-                None => "Type to search | Enter search | ↑/↓ select | Esc quit".to_string(),
+                None => {
+                    "Type to search | Enter search | ←/→ panel | ↑/↓ scroll | Esc quit"
+                        .to_string()
+                }
             };
             let help = Paragraph::new(help_text).block(Block::default().borders(Borders::ALL));
             let content_chunks = Layout::default()
@@ -97,13 +114,17 @@ async fn run_loop(
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(chunks[3]);
             let results = results_list(&state);
+            let mut results_state = ListState::default()
+                .with_offset(state.results_offset)
+                .with_selected((!state.results.is_empty()).then_some(state.selected));
             let details = room_details(&state);
 
             frame.render_widget(title, chunks[0]);
             frame.render_widget(search, chunks[1]);
             frame.render_widget(help, chunks[2]);
-            frame.render_widget(results, content_chunks[0]);
+            frame.render_stateful_widget(results, content_chunks[0], &mut results_state);
             frame.render_widget(details, content_chunks[1]);
+            state.results_offset = results_state.offset();
         })?;
 
         match event::read()? {
@@ -119,19 +140,44 @@ async fn run_loop(
 async fn handle_key(state: &mut AppState, code: KeyCode, pool: &SqlitePool) -> anyhow::Result<()> {
     match code {
         KeyCode::Esc => state.should_quit = true,
+        KeyCode::Right => state.focused_panel = FocusedPanel::Details,
+        KeyCode::Left => state.focused_panel = FocusedPanel::Results,
         KeyCode::Down => {
-            if state.selected + 1 < state.results.len() {
-                state.selected += 1;
+            if state.focused_panel == FocusedPanel::Results {
+                if state.selected + 1 < state.results.len() {
+                    state.selected += 1;
+                    state.details_scroll = 0;
+                }
+            } else {
+                state.details_scroll = state.details_scroll.saturating_add(1);
             }
         }
         KeyCode::Up => {
-            if state.selected > 0 {
-                state.selected -= 1;
+            if state.focused_panel == FocusedPanel::Results {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                    state.details_scroll = 0;
+                }
+            } else {
+                state.details_scroll = state.details_scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::PageDown => {
+            if state.focused_panel == FocusedPanel::Details {
+                state.details_scroll = state.details_scroll.saturating_add(5);
+            }
+        }
+        KeyCode::PageUp => {
+            if state.focused_panel == FocusedPanel::Details {
+                state.details_scroll = state.details_scroll.saturating_sub(5);
             }
         }
         KeyCode::Enter => {
             state.results = search_rooms(pool, &state.query, TUI_RESULT_LIMIT).await?;
             state.selected = 0;
+            state.results_offset = 0;
+            state.details_scroll = 0;
+            state.focused_panel = FocusedPanel::Results;
             state.has_searched = true;
             state.message = Some("Search submitted".to_string());
         }
@@ -152,20 +198,23 @@ async fn handle_key(state: &mut AppState, code: KeyCode, pool: &SqlitePool) -> a
 
 fn results_list(state: &AppState) -> List<'_> {
     if !state.has_searched {
-        return List::new(Vec::<ListItem>::new())
-            .block(Block::default().borders(Borders::ALL).title("Results"));
+        return List::new(Vec::<ListItem>::new()).block(panel_block(
+            "Results",
+            state.focused_panel == FocusedPanel::Results,
+        ));
     }
 
     if state.results.is_empty() {
-        return List::new(vec![ListItem::new("No results")])
-            .block(Block::default().borders(Borders::ALL).title("Results"));
+        return List::new(vec![ListItem::new("No results")]).block(panel_block(
+            "Results",
+            state.focused_panel == FocusedPanel::Results,
+        ));
     }
 
     let items = state
         .results
         .iter()
-        .enumerate()
-        .map(|(index, room)| {
+        .map(|room| {
             let id = room.canonical_alias.as_deref().unwrap_or(&room.room_id);
             let name = room.name.as_deref().unwrap_or("No name");
             let members = room
@@ -173,31 +222,32 @@ fn results_list(state: &AppState) -> List<'_> {
                 .map(|members| members.to_string())
                 .unwrap_or_else(|| "?".to_string());
 
-            let item = ListItem::new(format!(
+            ListItem::new(format!(
                 "{id}\n{name} | members: {members} | server: {}",
                 room.server
-            ));
-
-            if index == state.selected {
-                item.style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                item
-            }
+            ))
         })
         .collect::<Vec<_>>();
 
-    List::new(items).block(Block::default().borders(Borders::ALL).title("Results"))
+    List::new(items)
+        .block(panel_block(
+            "Results",
+            state.focused_panel == FocusedPanel::Results,
+        ))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
 }
 
 fn room_details(state: &AppState) -> Paragraph<'_> {
     let Some(room) = state.results.get(state.selected) else {
-        return Paragraph::new("Select a room")
-            .block(Block::default().borders(Borders::ALL).title("Details"));
+        return Paragraph::new("Select a room").block(panel_block(
+            "Details",
+            state.focused_panel == FocusedPanel::Details,
+        ));
     };
 
     let id = room.canonical_alias.as_deref().unwrap_or(&room.room_id);
@@ -217,6 +267,20 @@ fn room_details(state: &AppState) -> Paragraph<'_> {
         room.server,
         room.matrix_to_url()
     ))
-    .block(Block::default().borders(Borders::ALL).title("Details"))
+    .block(panel_block(
+        "Details",
+        state.focused_panel == FocusedPanel::Details,
+    ))
+    .scroll((state.details_scroll, 0))
     .wrap(Wrap { trim: true })
+}
+
+fn panel_block(title: &'static str, focused: bool) -> Block<'static> {
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if focused {
+        block.border_style(Style::default().fg(Color::Cyan))
+    } else {
+        block
+    }
 }
