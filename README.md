@@ -408,4 +408,4 @@ Main modules:
 
 ## License
 
-MIT placeholder.
+MIT. See [LICENSE](LICENSE).

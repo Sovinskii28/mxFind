@@ -462,4 +462,4 @@ cargo run -- tui
 
 ## Лицензия
 
-MIT placeholder.
+MIT. См. [LICENSE](LICENSE).
