@@ -1,3 +1,4 @@
+mod banner;
 mod cli;
 mod config;
 mod db;
@@ -10,6 +11,7 @@ mod tui;
 use clap::Parser;
 use futures::future::join_all;
 
+use crate::banner::print_banner;
 use crate::cli::{Cli, Command};
 use crate::config::load_config;
 use crate::db::{default_db_path, find_room, init_db, open_db, search_rooms, upsert_rooms};
@@ -23,7 +25,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Index { db, config } => {
+        None => {
+            print_banner();
+            println!();
+            println!("Run `mxfind --help` to see available commands.");
+        }
+
+        Some(Command::Index { db, config }) => {
             let config = load_config(config.as_deref())?;
             let db_path = match db {
                 Some(path) => path,
@@ -46,11 +54,11 @@ async fn main() -> anyhow::Result<()> {
             println!("Database path: {}", db_path.display());
         }
 
-        Command::Room {
+        Some(Command::Room {
             identifier,
             json,
             db,
-        } => {
+        }) => {
             let db_path = match db {
                 Some(path) => path,
                 None => default_db_path()?,
@@ -73,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Search {
+        Some(Command::Search {
             query,
             limit,
             json,
@@ -81,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             local,
             live,
             db,
-        } => {
+        }) => {
             if local && live {
                 anyhow::bail!("--live and --local cannot be used together");
             }
@@ -105,7 +113,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Tui { db } => {
+        Some(Command::Tui { db }) => {
+            print_banner();
+            println!();
+
             let db_path = match db {
                 Some(path) => path,
                 None => default_db_path()?,
