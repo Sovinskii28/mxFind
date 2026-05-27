@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.2.0-alpha.2"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -22,14 +27,26 @@ jobs:
             target: x86_64-unknown-linux-gnu
             binary_name: mxfind
             asset_name: mxfind-linux-x86_64
+            archive_name: mxfind-linux-x86_64.tar.gz
+            package_binary_name: mxfind
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: mxfind
+            asset_name: mxfind-macos-x86_64
+            archive_name: mxfind-macos-x86_64.tar.gz
+            package_binary_name: mxfind
           - os: macos-latest
             target: aarch64-apple-darwin
             binary_name: mxfind
             asset_name: mxfind-macos-arm64
+            archive_name: mxfind-macos-arm64.tar.gz
+            package_binary_name: mxfind
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             binary_name: mxfind.exe
-            asset_name: mxfind-windows-x86_64.exe
+            asset_name: mxfind-windows-x86_64
+            archive_name: mxfind-windows-x86_64.zip
+            package_binary_name: mxfind.exe
 
     steps:
       - name: Checkout
@@ -41,23 +58,50 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
         shell: bash
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "dist/${{ matrix.asset_name }}"
+          mkdir -p dist package
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "package/${{ matrix.package_binary_name }}"
+
+          if [[ "${{ matrix.archive_name }}" == *.zip ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path package/${{ matrix.package_binary_name }} -DestinationPath dist/${{ matrix.archive_name }}"
+          else
+            tar -czf "dist/${{ matrix.archive_name }}" -C package "${{ matrix.package_binary_name }}"
+          fi
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          path: dist/${{ matrix.archive_name }}
           if-no-files-found: error
 
-      - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: dist/${{ matrix.asset_name }}
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/* --clobber
+          else
+            gh release create "$TAG_NAME" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "$TAG_NAME" \
+              --generate-notes
+          fi
