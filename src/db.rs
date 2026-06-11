@@ -117,6 +117,102 @@ pub async fn upsert_rooms(pool: &SqlitePool, rooms: &[Room]) -> anyhow::Result<u
     Ok(rooms.len())
 }
 
+pub async fn prune_stale_rooms(
+    pool: &SqlitePool,
+    available_servers: &[String],
+    rooms: &[Room],
+) -> anyhow::Result<u64> {
+    if available_servers.is_empty() {
+        return Ok(0);
+    }
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("failed to start prune transaction")?;
+
+    query(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS prune_servers (
+            server TEXT PRIMARY KEY
+        )
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("failed to create temporary prune servers table")?;
+
+    query(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS prune_seen_rooms (
+            server TEXT NOT NULL,
+            room_id TEXT NOT NULL,
+            PRIMARY KEY (server, room_id)
+        )
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("failed to create temporary prune seen rooms table")?;
+
+    query("DELETE FROM prune_servers")
+        .execute(&mut *transaction)
+        .await
+        .context("failed to clear temporary prune servers table")?;
+
+    query("DELETE FROM prune_seen_rooms")
+        .execute(&mut *transaction)
+        .await
+        .context("failed to clear temporary prune seen rooms table")?;
+
+    for server in available_servers {
+        query("INSERT OR IGNORE INTO prune_servers (server) VALUES (?)")
+            .bind(server)
+            .execute(&mut *transaction)
+            .await
+            .with_context(|| format!("failed to track successfully scanned server {server}"))?;
+    }
+
+    for room in rooms {
+        query("INSERT OR IGNORE INTO prune_seen_rooms (server, room_id) VALUES (?, ?)")
+            .bind(&room.server)
+            .bind(&room.room_id)
+            .execute(&mut *transaction)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to track seen room {} from server {}",
+                    room.room_id, room.server
+                )
+            })?;
+    }
+
+    let result = query(
+        r#"
+        DELETE FROM rooms
+        WHERE
+            server IN (SELECT server FROM prune_servers)
+            AND NOT EXISTS (
+                SELECT 1
+                FROM prune_seen_rooms
+                WHERE
+                    prune_seen_rooms.server = rooms.server
+                    AND prune_seen_rooms.room_id = rooms.room_id
+            )
+        "#,
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("failed to prune stale rooms")?;
+
+    transaction
+        .commit()
+        .await
+        .context("failed to commit prune transaction")?;
+
+    Ok(result.rows_affected())
+}
+
 pub async fn search_rooms(
     pool: &SqlitePool,
     search_query: &str,
@@ -200,4 +296,81 @@ fn room_from_row(row: SqliteRow) -> anyhow::Result<Room> {
         num_joined_members,
         server: row.try_get("server")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sqlx::query_scalar;
+
+    use super::{init_db, open_db, prune_stale_rooms, upsert_rooms};
+    use crate::models::Room;
+
+    #[tokio::test]
+    async fn prune_stale_rooms_only_deletes_from_available_servers() {
+        let db_path = test_db_path("prune_stale_rooms_only_deletes_from_available_servers");
+        let pool = open_db(&db_path).await.expect("test db should open");
+        init_db(&pool).await.expect("schema should initialize");
+        assert_eq!(
+            query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'rooms_room_id_server_idx'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("index should be queryable"),
+            1
+        );
+
+        let existing_rooms = vec![
+            test_room("!fresh:matrix.org", "matrix.org"),
+            test_room("!stale:matrix.org", "matrix.org"),
+            test_room("!offline:offline.org", "offline.org"),
+        ];
+        upsert_rooms(&pool, &existing_rooms)
+            .await
+            .expect("existing rooms should insert");
+
+        let current_rooms = vec![test_room("!fresh:matrix.org", "matrix.org")];
+        let pruned = prune_stale_rooms(&pool, &["matrix.org".to_string()], &current_rooms)
+            .await
+            .expect("prune should succeed");
+
+        assert_eq!(pruned, 1);
+        assert_eq!(room_count(&pool, "!fresh:matrix.org").await, 1);
+        assert_eq!(room_count(&pool, "!stale:matrix.org").await, 0);
+        assert_eq!(room_count(&pool, "!offline:offline.org").await, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    fn test_room(room_id: &str, server: &str) -> Room {
+        Room {
+            room_id: room_id.to_string(),
+            name: None,
+            topic: None,
+            canonical_alias: None,
+            num_joined_members: None,
+            server: server.to_string(),
+        }
+    }
+
+    async fn room_count(pool: &sqlx::SqlitePool, room_id: &str) -> i64 {
+        query_scalar("SELECT COUNT(*) FROM rooms WHERE room_id = ?")
+            .bind(room_id)
+            .fetch_one(pool)
+            .await
+            .expect("room count should query")
+    }
+
+    fn test_db_path(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("mxfind-{name}-{now}.sqlite"))
+    }
 }

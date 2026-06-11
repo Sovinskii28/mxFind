@@ -15,7 +15,9 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::banner::print_banner;
 use crate::cli::{Cli, Command};
 use crate::config::load_config;
-use crate::db::{default_db_path, find_room, init_db, open_db, search_rooms, upsert_rooms};
+use crate::db::{
+    default_db_path, find_room, init_db, open_db, prune_stale_rooms, search_rooms, upsert_rooms,
+};
 use crate::matrix::fetch_public_rooms;
 use crate::models::Room;
 use crate::output::{
@@ -40,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
             db,
             config,
             verbose,
+            prune,
         }) => {
             let config = load_config(config.as_deref())?;
             let db_path = match db {
@@ -70,16 +73,25 @@ async fn main() -> anyhow::Result<()> {
             let servers_scanned = index_result.servers_scanned;
             let servers_available = index_result.servers_available;
             let servers_skipped = index_result.servers_skipped;
+            let available_servers = index_result.available_servers;
             let rooms = index_result.rooms;
             let rooms_fetched = rooms.len();
             let rooms = dedup_rooms(rooms);
             let rooms_saved = upsert_rooms(&pool, &rooms).await?;
+            let rooms_pruned = if prune {
+                prune_stale_rooms(&pool, &available_servers, &rooms).await?
+            } else {
+                0
+            };
 
             println!("Servers scanned: {servers_scanned}");
             println!("Servers available: {servers_available}");
             println!("Servers skipped: {servers_skipped}");
             println!("Rooms fetched: {rooms_fetched}");
             println!("Rooms saved: {rooms_saved}");
+            if prune {
+                println!("Rooms pruned: {rooms_pruned}");
+            }
             println!("Database path: {}", db_path.display());
             println!();
             println!("Done.");
@@ -223,6 +235,7 @@ async fn print_search_results(rooms: &[Room], limit: usize, json: bool) -> anyho
 
 struct FetchRoomsResult {
     rooms: Vec<Room>,
+    available_servers: Vec<String>,
     servers_scanned: usize,
     servers_available: usize,
     servers_skipped: usize,
@@ -243,6 +256,7 @@ async fn fetch_rooms_from_servers(
         .filter(|server| !server.is_empty())
         .collect();
     let mut rooms: Vec<Room> = Vec::new();
+    let mut available_servers = Vec::new();
     let mut servers_available = 0;
     let mut servers_skipped = 0;
     let servers_scanned = servers.len();
@@ -263,6 +277,7 @@ async fn fetch_rooms_from_servers(
         match result {
             Ok(mut server_rooms) => {
                 servers_available += 1;
+                available_servers.push(server.clone());
                 let rooms_count = server_rooms.len();
                 if progress.is_some() {
                     println!(
@@ -289,6 +304,7 @@ async fn fetch_rooms_from_servers(
 
     FetchRoomsResult {
         rooms,
+        available_servers,
         servers_scanned,
         servers_available,
         servers_skipped,

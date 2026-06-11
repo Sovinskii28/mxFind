@@ -31,6 +31,10 @@ pub enum Command {
         /// Print skipped homeservers and reasons.
         #[arg(short, long)]
         verbose: bool,
+
+        /// Remove stale rooms only for homeservers that were successfully scanned.
+        #[arg(long)]
+        prune: bool,
     },
 
     /// Show details for one indexed room.
