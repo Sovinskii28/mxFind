@@ -98,12 +98,16 @@ pub enum Command {
 
     /// Open the experimental terminal UI.
     Tui {
-        /// SQLite database path.
+        /// SQLite database path for local TUI search.
         #[arg(long)]
         db: Option<PathBuf>,
 
         /// TOML config path with homeservers to show in the server status block.
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Search rooms from the local SQLite database instead of live homeservers.
+        #[arg(long)]
+        local: bool,
     },
 }

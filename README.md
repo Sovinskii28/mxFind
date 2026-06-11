@@ -45,7 +45,7 @@ It can build a local SQLite index, search it quickly, inspect rooms, print compa
 - Inspect a single indexed room by room ID or canonical alias.
 - Check homeserver availability with `mxfind status`.
 - Show live server status next to rooms in human-readable output.
-- Explore the local index through an experimental TUI.
+- Explore rooms through an experimental TUI with live search by default.
 - Async networking with Tokio and Reqwest.
 
 ## How It Works
@@ -134,10 +134,17 @@ Inspect a room:
 mxfind room '#rust:matrix.org'
 ```
 
-Open the TUI:
+Open the TUI with live search:
 
 ```sh
 mxfind tui
+```
+
+Open the TUI with local SQLite search:
+
+```sh
+mxfind tui --local
+mxfind --local tui
 ```
 
 Check homeserver status:
@@ -255,7 +262,7 @@ Status meanings:
 
 ### `mxfind tui`
 
-Open the experimental terminal UI backed by the local SQLite index.
+Open the experimental terminal UI. By default, TUI searches live homeserver public directories.
 
 ```sh
 mxfind tui
@@ -265,10 +272,11 @@ Options:
 
 | Option | Purpose |
 | --- | --- |
-| `--db <path>` | Use a custom SQLite database path. |
+| `--db <path>` | Use a custom SQLite database path for local TUI search. |
 | `--config <path>` | Use a custom TOML config path for the server status block. |
+| `--local` | Search rooms from the local SQLite database instead of live homeservers. |
 
-Run `mxfind index` before opening the TUI.
+Run `mxfind index` before opening the TUI only when using `mxfind tui --local`.
 
 ## Output
 
@@ -364,7 +372,9 @@ Indexing behavior:
 
 ## TUI
 
-The TUI uses the local SQLite database for room search. It performs live network requests only for homeserver status checks.
+The TUI searches live homeserver public directories by default. Use `mxfind tui --local` or `mxfind --local tui` to search the local SQLite database instead.
+
+In both modes, the TUI may perform live network requests for homeserver and room alias status checks.
 
 Keys:
 

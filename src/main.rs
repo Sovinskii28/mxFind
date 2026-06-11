@@ -28,10 +28,11 @@ use crate::output::{
 use crate::room_status::check_rooms_status;
 use crate::search::{dedup_rooms, filter_rooms};
 use crate::server_status::check_servers_status;
+use std::ffi::OsString;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_cli_args(std::env::args_os()));
 
     match cli.command {
         None => {
@@ -176,26 +177,42 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Some(Command::Tui { db, config }) => {
+        Some(Command::Tui { db, config, local }) => {
             print_banner();
             println!();
 
             let config = load_config(config.as_deref())?;
-            let db_path = match db {
-                Some(path) => path,
-                None => default_db_path()?,
-            };
 
-            if !db_path.exists() {
-                anyhow::bail!("Local database not found. Run `mxfind index` first.");
+            if local {
+                let db_path = match db {
+                    Some(path) => path,
+                    None => default_db_path()?,
+                };
+
+                if !db_path.exists() {
+                    anyhow::bail!("Local database not found. Run `mxfind index` first.");
+                }
+
+                let pool = open_db(&db_path).await?;
+                tui::run_local(pool, config.servers).await?;
+            } else {
+                tui::run_live(config.servers).await?;
             }
-
-            let pool = open_db(&db_path).await?;
-            tui::run(pool, config.servers).await?;
         }
     }
 
     Ok(())
+}
+
+fn normalize_cli_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut args = args.into_iter().collect::<Vec<_>>();
+
+    if args.len() >= 3 && args.get(1).is_some_and(|arg| arg == "--local") && args[2] == "tui" {
+        args.remove(1);
+        args.insert(2, OsString::from("--local"));
+    }
+
+    args
 }
 
 async fn search_local_rooms(

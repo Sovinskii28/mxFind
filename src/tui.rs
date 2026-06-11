@@ -6,6 +6,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -14,8 +15,10 @@ use ratatui::Terminal;
 use sqlx::SqlitePool;
 
 use crate::db::search_rooms;
+use crate::matrix::fetch_public_rooms;
 use crate::models::{Room, RoomHealth, RoomStatus, ServerHealth, ServerStatus};
 use crate::room_status::check_rooms_status;
+use crate::search::{dedup_rooms, filter_rooms};
 use crate::server_status::check_servers_status;
 
 const TUI_RESULT_LIMIT: usize = 50;
@@ -30,12 +33,13 @@ pub struct AppState {
     results: Vec<Room>,
     server_statuses: Vec<ServerHealth>,
     room_statuses: std::collections::HashMap<String, RoomHealth>,
+    search_mode: SearchMode,
     has_searched: bool,
     message: Option<String>,
 }
 
 impl AppState {
-    fn new(server_statuses: Vec<ServerHealth>) -> Self {
+    fn new(server_statuses: Vec<ServerHealth>, search_mode: SearchMode) -> Self {
         Self {
             query: String::new(),
             selected: 0,
@@ -46,6 +50,7 @@ impl AppState {
             results: Vec::new(),
             server_statuses,
             room_statuses: std::collections::HashMap::new(),
+            search_mode,
             has_searched: false,
             message: None,
         }
@@ -58,7 +63,13 @@ enum FocusedPanel {
     Details,
 }
 
-pub async fn run(pool: SqlitePool, servers: Vec<String>) -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum SearchMode {
+    Live,
+    Local,
+}
+
+pub async fn run_live(servers: Vec<String>) -> anyhow::Result<()> {
     let server_statuses = check_servers_status(servers.clone()).await;
 
     enable_raw_mode()?;
@@ -70,7 +81,28 @@ pub async fn run(pool: SqlitePool, servers: Vec<String>) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    run_loop(&mut terminal, &pool, servers, server_statuses).await
+    run_loop(&mut terminal, SearchBackend::Live, servers, server_statuses).await
+}
+
+pub async fn run_local(pool: SqlitePool, servers: Vec<String>) -> anyhow::Result<()> {
+    let server_statuses = check_servers_status(servers.clone()).await;
+
+    enable_raw_mode()?;
+    let _guard = TerminalGuard;
+
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    run_loop(
+        &mut terminal,
+        SearchBackend::Local(pool),
+        servers,
+        server_statuses,
+    )
+    .await
 }
 
 struct TerminalGuard;
@@ -84,11 +116,11 @@ impl Drop for TerminalGuard {
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    pool: &SqlitePool,
+    backend: SearchBackend,
     servers: Vec<String>,
     server_statuses: Vec<ServerHealth>,
 ) -> anyhow::Result<()> {
-    let mut state = AppState::new(server_statuses);
+    let mut state = AppState::new(server_statuses, backend.search_mode());
 
     while !state.should_quit {
         // Draw the full TUI frame: layout, server status, search, help, results, and details.
@@ -108,7 +140,11 @@ async fn run_loop(
                 .alignment(Alignment::Center)
                 .block(Block::default().borders(Borders::ALL));
             let servers = servers_list(&state);
-            let search = Paragraph::new(format!("Search: {}", state.query))
+            let search = Paragraph::new(format!(
+                "Search [{}]: {}",
+                search_mode_label(state.search_mode),
+                state.query
+            ))
                 .block(Block::default().borders(Borders::ALL));
             let help_text = match &state.message {
                 Some(message) => {
@@ -143,7 +179,7 @@ async fn run_loop(
         })?;
 
         match event::read()? {
-            Event::Key(key) => handle_key(&mut state, key.code, pool, &servers).await?,
+            Event::Key(key) => handle_key(&mut state, key.code, &backend, &servers).await?,
             Event::Resize(_, _) => terminal.clear()?,
             _ => {}
         }
@@ -155,7 +191,7 @@ async fn run_loop(
 async fn handle_key(
     state: &mut AppState,
     code: KeyCode,
-    pool: &SqlitePool,
+    backend: &SearchBackend,
     servers: &[String],
 ) -> anyhow::Result<()> {
     match code {
@@ -193,7 +229,7 @@ async fn handle_key(
             }
         }
         KeyCode::Enter => {
-            state.results = search_rooms(pool, &state.query, TUI_RESULT_LIMIT).await?;
+            state.results = search_tui_rooms(backend, servers, &state.query).await?;
             state.server_statuses =
                 check_servers_status(tui_servers_to_check(servers, &state.results)).await;
             state.room_statuses = check_rooms_status(&state.results).await;
@@ -224,6 +260,67 @@ async fn handle_key(
     }
 
     Ok(())
+}
+
+enum SearchBackend {
+    Live,
+    Local(SqlitePool),
+}
+
+impl SearchBackend {
+    fn search_mode(&self) -> SearchMode {
+        match self {
+            Self::Live => SearchMode::Live,
+            Self::Local(_) => SearchMode::Local,
+        }
+    }
+}
+
+async fn search_tui_rooms(
+    backend: &SearchBackend,
+    servers: &[String],
+    query: &str,
+) -> anyhow::Result<Vec<Room>> {
+    match backend {
+        SearchBackend::Live => search_live_rooms(servers, query).await,
+        SearchBackend::Local(pool) => search_rooms(pool, query, TUI_RESULT_LIMIT).await,
+    }
+}
+
+async fn search_live_rooms(servers: &[String], query: &str) -> anyhow::Result<Vec<Room>> {
+    let mut requests = FuturesUnordered::new();
+
+    for server in servers
+        .iter()
+        .map(|server| server.trim())
+        .filter(|server| !server.is_empty())
+    {
+        requests.push(async move { fetch_public_rooms(server).await.unwrap_or_default() });
+    }
+
+    let mut rooms = Vec::new();
+
+    while let Some(mut server_rooms) = requests.next().await {
+        rooms.append(&mut server_rooms);
+    }
+
+    let mut rooms = filter_rooms(query, &dedup_rooms(rooms));
+    rooms.sort_by(|left, right| {
+        right
+            .num_joined_members
+            .unwrap_or(0)
+            .cmp(&left.num_joined_members.unwrap_or(0))
+    });
+    rooms.truncate(TUI_RESULT_LIMIT);
+
+    Ok(rooms)
+}
+
+fn search_mode_label(mode: SearchMode) -> &'static str {
+    match mode {
+        SearchMode::Live => "live",
+        SearchMode::Local => "local",
+    }
 }
 
 fn servers_list(state: &AppState) -> List<'_> {
