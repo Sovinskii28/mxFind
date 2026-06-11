@@ -77,10 +77,29 @@ pub enum Command {
         db: Option<PathBuf>,
     },
 
+    /// Check configured Matrix homeservers availability.
+    Status {
+        /// TOML config path with homeservers to check.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Check a single homeserver instead of configured homeservers.
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Print server status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Open the experimental terminal UI.
     Tui {
         /// SQLite database path.
         #[arg(long)]
         db: Option<PathBuf>,
+
+        /// TOML config path with homeservers to show in the server status block.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }

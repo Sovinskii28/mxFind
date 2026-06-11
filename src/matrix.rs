@@ -1,11 +1,13 @@
 use std::time::Duration;
+use std::time::Instant;
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::models::Room;
+use crate::models::{Room, ServerHealth, ServerStatus};
 
 const PUBLIC_ROOMS_PAGE_LIMIT: u64 = 100;
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct PublicRoomsResponse {
@@ -73,15 +75,7 @@ impl std::fmt::Display for PublicRoomsError {
 impl std::error::Error for PublicRoomsError {}
 
 pub async fn fetch_public_rooms(server: &str) -> Result<Vec<Room>, PublicRoomsError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| {
-            PublicRoomsError::new(
-                PublicRoomsErrorKind::NetworkError,
-                format!("failed to build HTTP client: {error}"),
-            )
-        })?;
+    let client = matrix_http_client(Duration::from_secs(10))?;
 
     let url = format!("https://{server}/_matrix/client/v3/publicRooms");
     let mut rooms = Vec::new();
@@ -131,6 +125,155 @@ pub async fn fetch_public_rooms(server: &str) -> Result<Vec<Room>, PublicRoomsEr
     Ok(rooms)
 }
 
+pub async fn check_server_health(server: &str) -> ServerHealth {
+    let server = server.trim().to_string();
+
+    if server.is_empty() {
+        return ServerHealth {
+            server,
+            status: ServerStatus::Unknown,
+            public_rooms_available: false,
+            latency_ms: None,
+            reason: Some("empty server name".to_string()),
+        };
+    }
+
+    let client = match matrix_http_client(HEALTH_CHECK_TIMEOUT) {
+        Ok(client) => client,
+        Err(error) => {
+            return ServerHealth {
+                server,
+                status: ServerStatus::Unknown,
+                public_rooms_available: false,
+                latency_ms: None,
+                reason: Some(error.to_string()),
+            };
+        }
+    };
+
+    let started_at = Instant::now();
+    let versions_url = format!("https://{server}/_matrix/client/versions");
+
+    let versions_response = match client.get(&versions_url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return ServerHealth {
+                server,
+                status: status_from_request_error(&error),
+                public_rooms_available: false,
+                latency_ms: Some(started_at.elapsed().as_millis()),
+                reason: Some(request_error_reason(&error)),
+            };
+        }
+    };
+
+    if !versions_response.status().is_success() {
+        return ServerHealth {
+            server,
+            status: ServerStatus::Unknown,
+            public_rooms_available: false,
+            latency_ms: Some(started_at.elapsed().as_millis()),
+            reason: Some(format!(
+                "versions endpoint returned {}",
+                versions_response.status()
+            )),
+        };
+    }
+
+    let public_rooms_url = format!("https://{server}/_matrix/client/v3/publicRooms");
+    let public_rooms_response = client
+        .get(&public_rooms_url)
+        .query(&PublicRoomsQuery {
+            limit: 1,
+            since: None,
+        })
+        .send()
+        .await;
+
+    match public_rooms_response {
+        Ok(response) => {
+            let status = response.status();
+            let classification = classify_public_rooms_health_status(status);
+
+            ServerHealth {
+                server,
+                status: classification.status,
+                public_rooms_available: classification.public_rooms_available,
+                latency_ms: Some(started_at.elapsed().as_millis()),
+                reason: classification
+                    .include_reason
+                    .then(|| format!("publicRooms endpoint returned {status}")),
+            }
+        }
+        Err(error) => ServerHealth {
+            server,
+            status: status_from_request_error(&error),
+            public_rooms_available: false,
+            latency_ms: Some(started_at.elapsed().as_millis()),
+            reason: Some(request_error_reason(&error)),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthStatusClassification {
+    status: ServerStatus,
+    public_rooms_available: bool,
+    include_reason: bool,
+}
+
+fn classify_public_rooms_health_status(status: StatusCode) -> HealthStatusClassification {
+    if status.is_success() {
+        return HealthStatusClassification {
+            status: ServerStatus::Online,
+            public_rooms_available: true,
+            include_reason: false,
+        };
+    }
+
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return HealthStatusClassification {
+            status: ServerStatus::Restricted,
+            public_rooms_available: false,
+            include_reason: true,
+        };
+    }
+
+    HealthStatusClassification {
+        status: ServerStatus::Unknown,
+        public_rooms_available: false,
+        include_reason: true,
+    }
+}
+
+fn matrix_http_client(timeout: Duration) -> Result<reqwest::Client, PublicRoomsError> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| {
+            PublicRoomsError::new(
+                PublicRoomsErrorKind::NetworkError,
+                format!("failed to build HTTP client: {error}"),
+            )
+        })
+}
+
+fn status_from_request_error(error: &reqwest::Error) -> ServerStatus {
+    if error.is_timeout() || error.is_connect() {
+        ServerStatus::Offline
+    } else {
+        ServerStatus::Unknown
+    }
+}
+
+fn request_error_reason(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "timeout".to_string()
+    } else {
+        format!("network error: {error}")
+    }
+}
+
 fn classify_request_error(error: reqwest::Error) -> PublicRoomsError {
     if error.is_timeout() {
         PublicRoomsError::new(PublicRoomsErrorKind::Timeout, "request timed out")
@@ -147,4 +290,59 @@ fn classify_http_status(status: StatusCode) -> PublicRoomsError {
     };
 
     PublicRoomsError::new(kind, status.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_public_rooms_health_status, HealthStatusClassification};
+    use crate::models::ServerStatus;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn successful_public_rooms_status_is_online() {
+        assert_eq!(
+            classify_public_rooms_health_status(StatusCode::OK),
+            HealthStatusClassification {
+                status: ServerStatus::Online,
+                public_rooms_available: true,
+                include_reason: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unauthorized_public_rooms_status_is_restricted() {
+        assert_eq!(
+            classify_public_rooms_health_status(StatusCode::UNAUTHORIZED),
+            HealthStatusClassification {
+                status: ServerStatus::Restricted,
+                public_rooms_available: false,
+                include_reason: true,
+            }
+        );
+    }
+
+    #[test]
+    fn forbidden_public_rooms_status_is_restricted() {
+        assert_eq!(
+            classify_public_rooms_health_status(StatusCode::FORBIDDEN),
+            HealthStatusClassification {
+                status: ServerStatus::Restricted,
+                public_rooms_available: false,
+                include_reason: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unexpected_public_rooms_status_is_unknown() {
+        assert_eq!(
+            classify_public_rooms_health_status(StatusCode::INTERNAL_SERVER_ERROR),
+            HealthStatusClassification {
+                status: ServerStatus::Unknown,
+                public_rooms_available: false,
+                include_reason: true,
+            }
+        );
+    }
 }

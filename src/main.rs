@@ -6,6 +6,7 @@ mod matrix;
 mod models;
 mod output;
 mod search;
+mod server_status;
 mod tui;
 
 use clap::Parser;
@@ -17,8 +18,12 @@ use crate::config::load_config;
 use crate::db::{default_db_path, find_room, init_db, open_db, search_rooms, upsert_rooms};
 use crate::matrix::fetch_public_rooms;
 use crate::models::Room;
-use crate::output::{print_room_card, print_room_json, print_rooms, print_rooms_json};
+use crate::output::{
+    print_room_card, print_room_json, print_rooms_json, print_rooms_with_server_statuses,
+    print_server_statuses, print_server_statuses_json,
+};
 use crate::search::{dedup_rooms, filter_rooms};
+use crate::server_status::{check_room_server_statuses, check_servers_status};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -132,17 +137,36 @@ async fn main() -> anyhow::Result<()> {
 
             if use_local {
                 let matches = search_local_rooms(&db_path, &query, limit).await?;
-                print_search_results(&matches, limit, json)?;
+                print_search_results(&matches, limit, json).await?;
             } else {
                 let matches = search_live_rooms(config.as_deref(), &query).await?;
-                print_search_results(&matches, limit, json)?;
+                print_search_results(&matches, limit, json).await?;
             }
         }
 
-        Some(Command::Tui { db }) => {
+        Some(Command::Status {
+            config,
+            server,
+            json,
+        }) => {
+            let servers = match server {
+                Some(server) => vec![server],
+                None => load_config(config.as_deref())?.servers,
+            };
+            let statuses = check_servers_status(servers).await;
+
+            if json {
+                print_server_statuses_json(&statuses)?;
+            } else {
+                print_server_statuses(&statuses);
+            }
+        }
+
+        Some(Command::Tui { db, config }) => {
             print_banner();
             println!();
 
+            let config = load_config(config.as_deref())?;
             let db_path = match db {
                 Some(path) => path,
                 None => default_db_path()?,
@@ -153,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let pool = open_db(&db_path).await?;
-            tui::run(pool).await?;
+            tui::run(pool, config.servers).await?;
         }
     }
 
@@ -185,12 +209,14 @@ async fn search_live_rooms(
     Ok(filter_rooms(query, &rooms))
 }
 
-fn print_search_results(rooms: &[Room], limit: usize, json: bool) -> anyhow::Result<()> {
+async fn print_search_results(rooms: &[Room], limit: usize, json: bool) -> anyhow::Result<()> {
     if json {
         print_rooms_json(rooms, limit)
     } else {
+        let server_statuses = check_room_server_statuses(rooms).await;
+
         println!("Found {} matching rooms", rooms.len());
-        print_rooms(rooms, limit);
+        print_rooms_with_server_statuses(rooms, limit, &server_statuses);
         Ok(())
     }
 }
