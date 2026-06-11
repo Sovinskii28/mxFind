@@ -42,6 +42,8 @@
 - Компактный CLI-вывод с alias, названием, количеством участников, сервером, topic preview и ссылкой `matrix.to`.
 - JSON-вывод без обрезания данных для автоматизации.
 - Просмотр полной карточки комнаты по room ID или canonical alias.
+- Диагностика homeserver'ов через `mxfind status`.
+- Live-статус сервера рядом с комнатами в человекочитаемом выводе.
 - Экспериментальный TUI для интерактивного локального поиска.
 - Асинхронная сеть на Tokio/Reqwest.
 
@@ -117,6 +119,12 @@ cargo run -- index
 mxfind index
 ```
 
+Безопасно удалить устаревшие комнаты только с успешно просканированных серверов:
+
+```sh
+mxfind index --prune
+```
+
 2. Найдите комнаты:
 
 ```sh
@@ -133,6 +141,13 @@ mxfind room '#rust:matrix.org'
 
 ```sh
 mxfind tui
+```
+
+5. Проверьте статус homeserver'ов:
+
+```sh
+mxfind status
+mxfind status --server matrix.org
 ```
 
 Если запускать из исходников, добавьте `cargo run --`:
@@ -166,12 +181,18 @@ mxfind index
 | `--db <path>` | Использовать пользовательский путь к SQLite-базе. |
 | `--config <path>` | Использовать пользовательский TOML-конфиг со списком серверов. |
 | `-v, --verbose` | Показать skipped homeserver'ы и причины. |
+| `--prune` | Удалить устаревшие комнаты только с homeserver'ов, которые были успешно просканированы. |
 
 Пример:
 
 ```sh
 mxfind index --config config.toml --db ./mxfind.sqlite
+mxfind index --prune
 ```
+
+По умолчанию `mxfind index` работает инкрементально: существующие комнаты обновляются, новые добавляются, старые не удаляются.
+
+`mxfind index --prune` выполняет безопасную очистку: удаляет stale-комнаты только для homeserver'ов, которые успешно ответили в текущем запуске. Комнаты с skipped, timed-out, offline или restricted серверов сохраняются.
 
 После завершения команда показывает:
 
@@ -179,6 +200,7 @@ mxfind index --config config.toml --db ./mxfind.sqlite
 - сколько серверов не ответило;
 - сколько комнат было получено;
 - сколько комнат было сохранено;
+- сколько комнат было удалено, если включен `--prune`;
 - путь к базе данных.
 
 ### `mxfind search <query>`
@@ -235,6 +257,33 @@ mxfind room '#rust:matrix.org'
 
 В отличие от обычного `search`, команда `room` показывает полный `topic`.
 
+### `mxfind status`
+
+Проверить доступность Matrix homeserver'ов.
+
+```sh
+mxfind status
+mxfind status --server matrix.org
+mxfind status --json
+```
+
+Опции:
+
+| Опция | Назначение |
+| --- | --- |
+| `--config <path>` | Использовать пользовательский TOML-конфиг со списком серверов. |
+| `--server <name>` | Проверить один homeserver вместо списка из конфига. |
+| `--json` | Вывести статусы серверов как JSON. |
+
+Значения статусов:
+
+| Статус | Значение |
+| --- | --- |
+| `online` | `publicRooms?limit=1` доступен. |
+| `restricted` | Сервер доступен, но public rooms требуют авторизацию или запрещены. |
+| `offline` | Таймаут или ошибка подключения. |
+| `unknown` | Сервер вернул неожиданный ответ. |
+
 ### `mxfind tui`
 
 Открыть экспериментальный терминальный интерфейс для локального поиска.
@@ -248,6 +297,7 @@ mxfind tui
 | Опция | Назначение |
 | --- | --- |
 | `--db <path>` | Использовать пользовательский путь к SQLite-базе. |
+| `--config <path>` | Использовать пользовательский TOML-конфиг для блока статусов серверов. |
 
 TUI требует существующую локальную базу. Перед первым запуском выполните:
 
@@ -266,6 +316,7 @@ Found 2 matching rooms
     Name:    Rust
     Members: 12000
     Server:  matrix.org
+    Status:  online
     Topic:   Rust programming language community
     Link:    https://matrix.to/#/#rust:matrix.org
 ```
@@ -277,6 +328,8 @@ Found 2 matching rooms
 - `topic` обрезается до короткого preview;
 - `name`, `room_id` и `canonical_alias` не обрезаются;
 - ссылка `matrix.to` строится из canonical alias, если он есть, иначе из room ID.
+
+Человекочитаемый `search` также выполняет live-проверку статуса homeserver'ов из результатов и показывает статус рядом с каждой комнатой. JSON-вывод сохраняет исходную схему комнаты для совместимости со скриптами и не добавляет live-статус.
 
 JSON-вывод не обрезает данные:
 
@@ -327,6 +380,7 @@ mxfind search rust --live --config config.toml
 
 ```sh
 mxfind index --db ./mxfind.sqlite
+mxfind index --prune --db ./mxfind.sqlite
 mxfind search rust --db ./mxfind.sqlite
 mxfind room '#rust:matrix.org' --db ./mxfind.sqlite
 mxfind tui --db ./mxfind.sqlite
@@ -345,9 +399,17 @@ mxfind tui --db ./mxfind.sqlite
 
 Данные не обрезаются перед сохранением. Обрезание topic применяется только к обычному человекочитаемому `search` output.
 
+Поведение индексации:
+
+- `mxfind index` инкрементальный и не удаляет существующие комнаты.
+- `mxfind index --prune` удаляет устаревшие комнаты только для homeserver'ов, которые были успешно просканированы в текущем запуске.
+- Prune не удаляет комнаты с серверов, которые упали, timed out или были skipped.
+
 ## TUI
 
 TUI - экспериментальный локальный интерфейс поверх SQLite-индекса.
+
+Поиск комнат в TUI идет только по локальной SQLite-базе. Сетевые запросы выполняются только для live-статуса homeserver'ов.
 
 Основные клавиши:
 
@@ -358,10 +420,11 @@ TUI - экспериментальный локальный интерфейс �
 | `Up` / `Down` | Перемещение по результатам или скролл деталей. |
 | `Left` / `Right` | Переключение между списком результатов и деталями. |
 | `PageUp` / `PageDown` | Быстрый скролл деталей. |
+| `r` | Обновить статусы серверов, если поисковая строка пустая. |
 | `Esc` | Выход. |
 | `q` | Выход, если поисковая строка пустая. |
 
-TUI не выполняет сетевые запросы. Он работает только с локальной базой.
+Блок `Servers` показывает настроенные homeserver'ы как `online`, `offline`, `restricted` или `unknown`. В результатах поиска и карточке комнаты также показывается live-статус сервера, с которого комната была найдена.
 
 ## Ограничения Matrix federation
 
@@ -426,9 +489,11 @@ cargo test
 cargo run
 cargo run -- --help
 cargo run -- index
+cargo run -- index --prune
 cargo run -- search rust --limit 5
 cargo run -- search rust --json
 cargo run -- room '#rust:matrix.org'
+cargo run -- status
 cargo run -- tui
 ```
 
@@ -441,8 +506,9 @@ cargo run -- tui
 | `src/banner.rs` | CLI banner и branding. |
 | `src/config.rs` | Загрузка TOML-конфига и серверы по умолчанию. |
 | `src/matrix.rs` | Запросы к Matrix Client-Server API. |
-| `src/db.rs` | SQLite schema, upsert, local search и lookup комнаты. |
+| `src/db.rs` | SQLite schema, upsert, безопасный prune, local search и lookup комнаты. |
 | `src/search.rs` | Фильтрация и дедупликация комнат. |
+| `src/server_status.rs` | Use-case'ы статуса серверов и связывание комнат со статусом их сервера. |
 | `src/output.rs` | Человекочитаемый вывод, JSON и topic preview. |
 | `src/tui.rs` | Экспериментальный терминальный интерфейс. |
 | `src/models.rs` | Общие модели данных. |
@@ -454,11 +520,9 @@ cargo run -- tui
 - полнотекстовый поиск через SQLite FTS5;
 - фильтры `--server`, `--min-members`, `--has-alias`;
 - команда `stats`;
-- инкрементальная индексация и очистка устаревших комнат;
 - экспорт CSV;
 - закладки и пользовательские теги;
 - улучшенный TUI с поиском по мере ввода;
-- health-check homeserver'ов.
 
 ## Лицензия
 

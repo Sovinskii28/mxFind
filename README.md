@@ -43,6 +43,8 @@ It can build a local SQLite index, search it quickly, inspect rooms, print compa
 - Print compact human-readable search results.
 - Print full JSON without truncating data.
 - Inspect a single indexed room by room ID or canonical alias.
+- Check homeserver availability with `mxfind status`.
+- Show live server status next to rooms in human-readable output.
 - Explore the local index through an experimental TUI.
 - Async networking with Tokio and Reqwest.
 
@@ -114,6 +116,12 @@ Build or refresh the local index:
 mxfind index
 ```
 
+Safely remove stale rooms from successfully scanned homeservers:
+
+```sh
+mxfind index --prune
+```
+
 Search rooms:
 
 ```sh
@@ -130,6 +138,13 @@ Open the TUI:
 
 ```sh
 mxfind tui
+```
+
+Check homeserver status:
+
+```sh
+mxfind status
+mxfind status --server matrix.org
 ```
 
 ## Commands
@@ -157,6 +172,11 @@ Options:
 | `--db <path>` | Use a custom SQLite database path. |
 | `--config <path>` | Use a custom TOML config path. |
 | `-v, --verbose` | Print skipped homeservers and reasons. |
+| `--prune` | Remove stale rooms only for homeservers that were successfully scanned. |
+
+By default, indexing is incremental: existing rooms are updated or inserted, and old rooms remain in the database.
+
+Use `--prune` when you want safer cleanup. It deletes stale rooms only for homeservers that successfully responded during the current indexing run. Rooms from skipped, timed-out, offline, or restricted homeservers are preserved.
 
 ### `mxfind search <query>`
 
@@ -206,6 +226,33 @@ Options:
 
 Room details keep the full topic.
 
+### `mxfind status`
+
+Check Matrix homeserver availability.
+
+```sh
+mxfind status
+mxfind status --server matrix.org
+mxfind status --json
+```
+
+Options:
+
+| Option | Purpose |
+| --- | --- |
+| `--config <path>` | Use a custom TOML config path. |
+| `--server <name>` | Check a single homeserver instead of configured homeservers. |
+| `--json` | Print server statuses as JSON. |
+
+Status meanings:
+
+| Status | Meaning |
+| --- | --- |
+| `online` | `publicRooms?limit=1` is reachable. |
+| `restricted` | The server is reachable but public rooms are unauthorized or forbidden. |
+| `offline` | The request timed out or failed to connect. |
+| `unknown` | The server returned an unexpected response. |
+
 ### `mxfind tui`
 
 Open the experimental terminal UI backed by the local SQLite index.
@@ -219,6 +266,7 @@ Options:
 | Option | Purpose |
 | --- | --- |
 | `--db <path>` | Use a custom SQLite database path. |
+| `--config <path>` | Use a custom TOML config path for the server status block. |
 
 Run `mxfind index` before opening the TUI.
 
@@ -233,11 +281,14 @@ Found 2 matching rooms
     Name:    Rust
     Members: 12000
     Server:  matrix.org
+    Status:  online
     Topic:   Rust programming language community
     Link:    https://matrix.to/#/#rust:matrix.org
 ```
 
 For search output, `topic` is normalized to one line and truncated to a short preview. `name`, `room_id`, and `canonical_alias` are not truncated.
+
+Human-readable search output also performs live status checks for the homeservers in the result set and prints status per room. JSON search output keeps the original room schema for scripting compatibility and does not embed live status.
 
 JSON output keeps full data:
 
@@ -286,6 +337,7 @@ Override it:
 
 ```sh
 mxfind index --db ./mxfind.sqlite
+mxfind index --prune --db ./mxfind.sqlite
 mxfind search rust --db ./mxfind.sqlite
 mxfind room '#rust:matrix.org' --db ./mxfind.sqlite
 mxfind tui --db ./mxfind.sqlite
@@ -304,9 +356,15 @@ Stored room metadata includes:
 
 Data is not truncated before being saved to SQLite.
 
+Indexing behavior:
+
+- `mxfind index` is incremental and does not delete existing rooms.
+- `mxfind index --prune` removes stale rooms only for homeservers that were successfully scanned in the current run.
+- Prune does not delete rooms from homeservers that timed out, failed, or were skipped.
+
 ## TUI
 
-The TUI is local-only and does not perform network requests.
+The TUI uses the local SQLite database for room search. It performs live network requests only for homeserver status checks.
 
 Keys:
 
@@ -317,8 +375,11 @@ Keys:
 | `Up` / `Down` | Move through results or scroll details. |
 | `Left` / `Right` | Switch focused panel. |
 | `PageUp` / `PageDown` | Scroll details faster. |
+| `r` | Refresh server statuses when the query is empty. |
 | `Esc` | Quit. |
 | `q` | Quit when the query is empty. |
+
+The `Servers` block shows configured homeservers as `online`, `offline`, `restricted`, or `unknown`. Search results and room details also show the live status for each room's source server.
 
 ## Matrix Federation Limits
 
@@ -374,9 +435,11 @@ Manual checks:
 cargo run
 cargo run -- --help
 cargo run -- index
+cargo run -- index --prune
 cargo run -- search rust --limit 5
 cargo run -- search rust --json
 cargo run -- room '#rust:matrix.org'
+cargo run -- status
 cargo run -- tui
 ```
 
@@ -389,8 +452,9 @@ Main modules:
 | `src/banner.rs` | CLI banner and branding. |
 | `src/config.rs` | TOML config loading and default servers. |
 | `src/matrix.rs` | Matrix Client-Server API requests. |
-| `src/db.rs` | SQLite schema, upsert, local search, and room lookup. |
+| `src/db.rs` | SQLite schema, upsert, safe pruning, local search, and room lookup. |
 | `src/search.rs` | Room filtering and deduplication. |
+| `src/server_status.rs` | Server-status use cases and room-to-server status orchestration. |
 | `src/output.rs` | Human output, JSON output, and topic preview. |
 | `src/tui.rs` | Experimental terminal UI. |
 | `src/models.rs` | Shared data models. |
@@ -400,11 +464,9 @@ Main modules:
 - SQLite FTS5 full-text search.
 - Filters such as `--server`, `--min-members`, and `--has-alias`.
 - `stats` command.
-- Incremental indexing and pruning stale rooms.
 - CSV export.
 - Bookmarks and user tags.
 - Better TUI with search-as-you-type.
-- Homeserver health checks.
 
 ## License
 
