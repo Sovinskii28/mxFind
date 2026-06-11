@@ -14,7 +14,8 @@ use ratatui::Terminal;
 use sqlx::SqlitePool;
 
 use crate::db::search_rooms;
-use crate::models::{Room, ServerHealth, ServerStatus};
+use crate::models::{Room, RoomHealth, RoomStatus, ServerHealth, ServerStatus};
+use crate::room_status::check_rooms_status;
 use crate::server_status::check_servers_status;
 
 const TUI_RESULT_LIMIT: usize = 50;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub should_quit: bool,
     results: Vec<Room>,
     server_statuses: Vec<ServerHealth>,
+    room_statuses: std::collections::HashMap<String, RoomHealth>,
     has_searched: bool,
     message: Option<String>,
 }
@@ -43,6 +45,7 @@ impl AppState {
             should_quit: false,
             results: Vec::new(),
             server_statuses,
+            room_statuses: std::collections::HashMap::new(),
             has_searched: false,
             message: None,
         }
@@ -88,6 +91,7 @@ async fn run_loop(
     let mut state = AppState::new(server_statuses);
 
     while !state.should_quit {
+        // Draw the full TUI frame: layout, server status, search, help, results, and details.
         terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
@@ -109,11 +113,11 @@ async fn run_loop(
             let help_text = match &state.message {
                 Some(message) => {
                     format!(
-                        "Type to search | Enter search | r refresh servers | ←/→ panel | ↑/↓ scroll | Esc quit | {message}"
+                        "Type to search | Enter search | r refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit | {message}"
                     )
                 }
                 None => {
-                    "Type to search | Enter search | r refresh servers | ←/→ panel | ↑/↓ scroll | Esc quit"
+                    "Type to search | Enter search | r refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit"
                         .to_string()
                 }
             };
@@ -135,6 +139,7 @@ async fn run_loop(
             frame.render_stateful_widget(results, content_chunks[0], &mut results_state);
             frame.render_widget(details, content_chunks[1]);
             state.results_offset = results_state.offset();
+            // End of full TUI frame drawing.
         })?;
 
         match event::read()? {
@@ -191,6 +196,7 @@ async fn handle_key(
             state.results = search_rooms(pool, &state.query, TUI_RESULT_LIMIT).await?;
             state.server_statuses =
                 check_servers_status(tui_servers_to_check(servers, &state.results)).await;
+            state.room_statuses = check_rooms_status(&state.results).await;
             state.selected = 0;
             state.results_offset = 0;
             state.details_scroll = 0;
@@ -204,10 +210,11 @@ async fn handle_key(
         }
         KeyCode::Char('q') if state.query.is_empty() => state.should_quit = true,
         KeyCode::Char('r') if state.query.is_empty() => {
-            state.message = Some("Refreshing server status...".to_string());
+            state.message = Some("Refreshing statuses...".to_string());
             state.server_statuses =
                 check_servers_status(tui_servers_to_check(servers, &state.results)).await;
-            state.message = Some("Server status refreshed".to_string());
+            state.room_statuses = check_rooms_status(&state.results).await;
+            state.message = Some("Statuses refreshed".to_string());
         }
         KeyCode::Char(character) => {
             state.query.push(character);
@@ -282,10 +289,10 @@ fn results_list(state: &AppState) -> List<'_> {
                 .num_joined_members
                 .map(|members| members.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let server_status = room_server_status_label(state, &room.server);
+            let room_status = room_status_label_for_room(state, &room.room_id);
 
             ListItem::new(format!(
-                "{id}\n{name} | members: {members} | server: {} | status: {server_status}",
+                "{id}\n{name} | members: {members} | server: {} | room: {room_status}",
                 room.server,
             ))
         })
@@ -319,14 +326,14 @@ fn room_details(state: &AppState) -> Paragraph<'_> {
         .num_joined_members
         .map(|members| members.to_string())
         .unwrap_or_else(|| "?".to_string());
-    let server_status = room_server_status_label(state, &room.server);
+    let room_status = room_status_label_for_room(state, &room.room_id);
 
     Paragraph::new(format!(
         "{id}\n\nname: {name}\n\n\
+         room status: {room_status}\n\
          topic: {topic}\n\n\
          members: {members}\n\
          server: {}\n\
-         server status: {server_status}\n\
          matrix.to: {}",
         room.server,
         room.matrix_to_url()
@@ -355,12 +362,11 @@ fn tui_servers_to_check(base_servers: &[String], rooms: &[Room]) -> Vec<String> 
     servers
 }
 
-fn room_server_status_label<'a>(state: &'a AppState, server: &str) -> &'a str {
+fn room_status_label_for_room<'a>(state: &'a AppState, room_id: &str) -> &'a str {
     state
-        .server_statuses
-        .iter()
-        .find(|health| health.server == server)
-        .map(|health| server_status_label(health.status))
+        .room_statuses
+        .get(room_id)
+        .map(|health| room_status_label(health.status))
         .unwrap_or("not checked")
 }
 
@@ -379,5 +385,14 @@ fn server_status_color(status: ServerStatus) -> Color {
         ServerStatus::Offline => Color::Red,
         ServerStatus::Restricted => Color::Yellow,
         ServerStatus::Unknown => Color::Gray,
+    }
+}
+
+fn room_status_label(status: RoomStatus) -> &'static str {
+    match status {
+        RoomStatus::Resolvable => "resolvable",
+        RoomStatus::NotFound => "not found",
+        RoomStatus::NoAlias => "no alias",
+        RoomStatus::Unknown => "unknown",
     }
 }

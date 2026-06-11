@@ -18,6 +18,24 @@ pub enum ServerStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomHealth {
+    pub room_id: String,
+    pub alias: Option<String>,
+    pub status: RoomStatus,
+    pub resolved_room_id: Option<String>,
+    pub latency_ms: Option<u128>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoomStatus {
+    Resolvable,
+    NotFound,
+    NoAlias,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Room {
     pub room_id: String,
     pub name: Option<String>,

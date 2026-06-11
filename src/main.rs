@@ -5,6 +5,7 @@ mod db;
 mod matrix;
 mod models;
 mod output;
+mod room_status;
 mod search;
 mod server_status;
 mod tui;
@@ -21,11 +22,12 @@ use crate::db::{
 use crate::matrix::fetch_public_rooms;
 use crate::models::Room;
 use crate::output::{
-    print_room_card, print_room_json, print_rooms_json, print_rooms_with_server_statuses,
+    print_room_card, print_room_json, print_rooms_json, print_rooms_with_room_statuses,
     print_server_statuses, print_server_statuses_json,
 };
+use crate::room_status::check_rooms_status;
 use crate::search::{dedup_rooms, filter_rooms};
-use crate::server_status::{check_room_server_statuses, check_servers_status};
+use crate::server_status::check_servers_status;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -225,10 +227,10 @@ async fn print_search_results(rooms: &[Room], limit: usize, json: bool) -> anyho
     if json {
         print_rooms_json(rooms, limit)
     } else {
-        let server_statuses = check_room_server_statuses(rooms).await;
+        let room_statuses = check_rooms_status(rooms).await;
 
         println!("Found {} matching rooms", rooms.len());
-        print_rooms_with_server_statuses(rooms, limit, &server_statuses);
+        print_rooms_with_room_statuses(rooms, limit, &room_statuses);
         Ok(())
     }
 }

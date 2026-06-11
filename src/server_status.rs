@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::matrix::check_server_health;
-use crate::models::{Room, ServerHealth};
+use crate::models::ServerHealth;
 
 pub async fn check_servers_status(servers: Vec<String>) -> Vec<ServerHealth> {
     let servers = normalize_servers(servers);
@@ -27,19 +27,6 @@ pub async fn check_servers_status(servers: Vec<String>) -> Vec<ServerHealth> {
         .into_iter()
         .map(|(_, health)| health)
         .collect::<Vec<_>>()
-}
-
-pub async fn check_room_server_statuses(rooms: &[Room]) -> HashMap<String, ServerHealth> {
-    let servers = rooms
-        .iter()
-        .map(|room| room.server.clone())
-        .collect::<Vec<_>>();
-    let statuses = check_servers_status(servers).await;
-
-    statuses
-        .into_iter()
-        .map(|health| (health.server.clone(), health))
-        .collect()
 }
 
 fn normalize_servers(servers: Vec<String>) -> Vec<String> {

@@ -4,7 +4,7 @@ use std::time::Instant;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Room, ServerHealth, ServerStatus};
+use crate::models::{Room, RoomHealth, RoomStatus, ServerHealth, ServerStatus};
 
 const PUBLIC_ROOMS_PAGE_LIMIT: u64 = 100;
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -29,6 +29,22 @@ struct PublicRoom {
     topic: Option<String>,
     canonical_alias: Option<String>,
     num_joined_members: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RoomDirectoryResponse {
+    room_id: String,
+}
+
+#[derive(Deserialize)]
+struct ClientWellKnown {
+    #[serde(rename = "m.homeserver")]
+    homeserver: Option<ClientWellKnownHomeserver>,
+}
+
+#[derive(Deserialize)]
+struct ClientWellKnownHomeserver {
+    base_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +203,120 @@ pub async fn check_server_health(server: &str) -> ServerHealth {
     }
 }
 
+pub async fn check_room_health(room: &Room) -> RoomHealth {
+    let Some(alias) = room.canonical_alias.as_deref() else {
+        return RoomHealth {
+            room_id: room.room_id.clone(),
+            alias: None,
+            status: RoomStatus::NoAlias,
+            resolved_room_id: None,
+            latency_ms: None,
+            reason: Some("room has no canonical alias".to_string()),
+        };
+    };
+
+    let client = match matrix_http_client(HEALTH_CHECK_TIMEOUT) {
+        Ok(client) => client,
+        Err(error) => {
+            return RoomHealth {
+                room_id: room.room_id.clone(),
+                alias: Some(alias.to_string()),
+                status: RoomStatus::Unknown,
+                resolved_room_id: None,
+                latency_ms: None,
+                reason: Some(error.to_string()),
+            };
+        }
+    };
+
+    let encoded_alias = percent_encode_path_segment(alias);
+    let alias_server = room_alias_server_name(alias).unwrap_or(&room.server);
+    let base_url = discover_client_base_url(&client, alias_server).await;
+    let url = format!("{base_url}/_matrix/client/v3/directory/room/{encoded_alias}");
+    let started_at = Instant::now();
+    let response = client.get(&url).send().await;
+
+    match response {
+        Ok(response) if response.status().is_success() => {
+            let latency_ms = Some(started_at.elapsed().as_millis());
+            match response.json::<RoomDirectoryResponse>().await {
+                Ok(directory) => RoomHealth {
+                    room_id: room.room_id.clone(),
+                    alias: Some(alias.to_string()),
+                    status: RoomStatus::Resolvable,
+                    resolved_room_id: Some(directory.room_id),
+                    latency_ms,
+                    reason: None,
+                },
+                Err(error) => RoomHealth {
+                    room_id: room.room_id.clone(),
+                    alias: Some(alias.to_string()),
+                    status: RoomStatus::Unknown,
+                    resolved_room_id: None,
+                    latency_ms,
+                    reason: Some(format!("invalid directory response: {error}")),
+                },
+            }
+        }
+        Ok(response) if response.status() == StatusCode::NOT_FOUND => RoomHealth {
+            room_id: room.room_id.clone(),
+            alias: Some(alias.to_string()),
+            status: RoomStatus::NotFound,
+            resolved_room_id: None,
+            latency_ms: Some(started_at.elapsed().as_millis()),
+            reason: Some(format!("directory endpoint returned {}", response.status())),
+        },
+        Ok(response) => RoomHealth {
+            room_id: room.room_id.clone(),
+            alias: Some(alias.to_string()),
+            status: RoomStatus::Unknown,
+            resolved_room_id: None,
+            latency_ms: Some(started_at.elapsed().as_millis()),
+            reason: Some(format!("directory endpoint returned {}", response.status())),
+        },
+        Err(error) => RoomHealth {
+            room_id: room.room_id.clone(),
+            alias: Some(alias.to_string()),
+            status: RoomStatus::Unknown,
+            resolved_room_id: None,
+            latency_ms: Some(started_at.elapsed().as_millis()),
+            reason: Some(request_error_reason(&error)),
+        },
+    }
+}
+
+async fn discover_client_base_url(client: &reqwest::Client, server_name: &str) -> String {
+    let fallback = format!("https://{server_name}");
+    let url = format!("{fallback}/.well-known/matrix/client");
+
+    let Ok(response) = client.get(url).send().await else {
+        return fallback;
+    };
+
+    if !response.status().is_success() {
+        return fallback;
+    }
+
+    let Ok(well_known) = response.json::<ClientWellKnown>().await else {
+        return fallback;
+    };
+
+    well_known
+        .homeserver
+        .and_then(|homeserver| normalize_client_base_url(&homeserver.base_url))
+        .unwrap_or(fallback)
+}
+
+fn normalize_client_base_url(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+
+    if base_url.starts_with("https://") || base_url.starts_with("http://") {
+        Some(base_url.to_string())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HealthStatusClassification {
     status: ServerStatus,
@@ -246,6 +376,31 @@ fn request_error_reason(error: &reqwest::Error) -> String {
     }
 }
 
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    encoded
+}
+
+fn room_alias_server_name(alias: &str) -> Option<&str> {
+    let (_, server_name) = alias.rsplit_once(':')?;
+
+    if alias.starts_with('#') && !server_name.is_empty() {
+        Some(server_name)
+    } else {
+        None
+    }
+}
+
 fn classify_request_error(error: reqwest::Error) -> PublicRoomsError {
     if error.is_timeout() {
         PublicRoomsError::new(PublicRoomsErrorKind::Timeout, "request timed out")
@@ -266,7 +421,10 @@ fn classify_http_status(status: StatusCode) -> PublicRoomsError {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_public_rooms_health_status, HealthStatusClassification};
+    use super::{
+        classify_public_rooms_health_status, normalize_client_base_url,
+        percent_encode_path_segment, room_alias_server_name, HealthStatusClassification,
+    };
     use crate::models::ServerStatus;
     use reqwest::StatusCode;
 
@@ -316,5 +474,36 @@ mod tests {
                 include_reason: true,
             }
         );
+    }
+
+    #[test]
+    fn room_alias_is_encoded_as_one_path_segment() {
+        assert_eq!(
+            percent_encode_path_segment("#rabbithole:kawaiiloli.twilightparadox.com"),
+            "%23rabbithole%3Akawaiiloli.twilightparadox.com"
+        );
+    }
+
+    #[test]
+    fn room_alias_server_name_is_extracted_from_alias() {
+        assert_eq!(
+            room_alias_server_name("#rabbithole:kawaiiloli.twilightparadox.com"),
+            Some("kawaiiloli.twilightparadox.com")
+        );
+    }
+
+    #[test]
+    fn malformed_room_alias_has_no_server_name() {
+        assert_eq!(room_alias_server_name("!room:matrix.org"), None);
+        assert_eq!(room_alias_server_name("#room:"), None);
+    }
+
+    #[test]
+    fn client_base_url_is_normalized() {
+        assert_eq!(
+            normalize_client_base_url("https://matrix.example.org/"),
+            Some("https://matrix.example.org".to_string())
+        );
+        assert_eq!(normalize_client_base_url("matrix.example.org"), None);
     }
 }

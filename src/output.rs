@@ -2,14 +2,14 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 
-use crate::models::{Room, ServerHealth, ServerStatus};
+use crate::models::{Room, RoomHealth, RoomStatus, ServerHealth, ServerStatus};
 
 const SEARCH_TOPIC_PREVIEW_LEN: usize = 140;
 
-pub fn print_rooms_with_server_statuses(
+pub fn print_rooms_with_room_statuses(
     rooms: &[Room],
     limit: usize,
-    server_statuses: &HashMap<String, ServerHealth>,
+    room_statuses: &HashMap<String, RoomHealth>,
 ) {
     let rooms = sorted_limited_rooms(rooms, limit);
 
@@ -27,16 +27,16 @@ pub fn print_rooms_with_server_statuses(
             .unwrap_or_else(|| "?".to_string());
         let topic = format_topic_preview(room.topic.as_deref(), SEARCH_TOPIC_PREVIEW_LEN)
             .unwrap_or_else(|| "No topic".to_string());
-        let server_status = server_statuses
-            .get(&room.server)
-            .map(|health| server_status_label(health.status))
+        let room_status = room_statuses
+            .get(&room.room_id)
+            .map(|health| room_status_label(health.status))
             .unwrap_or("not checked");
 
         println!("[{}] {id}", index + 1);
         println!("    Name:    {name}");
         println!("    Members: {members}");
         println!("    Server:  {}", room.server);
-        println!("    Status:  {server_status}");
+        println!("    Status:  {room_status}");
         println!("    Topic:   {topic}");
         println!("    Link:    {}", room.matrix_to_url());
         println!();
@@ -141,6 +141,15 @@ fn server_status_label(status: ServerStatus) -> &'static str {
     }
 }
 
+fn room_status_label(status: RoomStatus) -> &'static str {
+    match status {
+        RoomStatus::Resolvable => "resolvable",
+        RoomStatus::NotFound => "not found",
+        RoomStatus::NoAlias => "no alias",
+        RoomStatus::Unknown => "unknown",
+    }
+}
+
 fn format_server_status_line(health: &ServerHealth) -> String {
     let latency = health
         .latency_ms
@@ -168,10 +177,10 @@ fn format_server_status_line(health: &ServerHealth) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_server_status_line, format_topic_preview, normalize_whitespace, server_status_label,
-        truncate_chars,
+        format_server_status_line, format_topic_preview, normalize_whitespace, room_status_label,
+        server_status_label, truncate_chars,
     };
-    use crate::models::{ServerHealth, ServerStatus};
+    use crate::models::{RoomStatus, ServerHealth, ServerStatus};
 
     #[test]
     fn topic_with_newlines_becomes_one_line() {
@@ -221,6 +230,14 @@ mod tests {
         assert_eq!(server_status_label(ServerStatus::Offline), "offline");
         assert_eq!(server_status_label(ServerStatus::Restricted), "restricted");
         assert_eq!(server_status_label(ServerStatus::Unknown), "unknown");
+    }
+
+    #[test]
+    fn room_status_labels_are_stable() {
+        assert_eq!(room_status_label(RoomStatus::Resolvable), "resolvable");
+        assert_eq!(room_status_label(RoomStatus::NotFound), "not found");
+        assert_eq!(room_status_label(RoomStatus::NoAlias), "no alias");
+        assert_eq!(room_status_label(RoomStatus::Unknown), "unknown");
     }
 
     #[test]
