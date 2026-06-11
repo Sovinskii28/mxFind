@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::{Room, ServerHealth, ServerStatus};
 
 const PUBLIC_ROOMS_PAGE_LIMIT: u64 = 100;
-const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 struct PublicRoomsResponse {
@@ -151,36 +151,8 @@ pub async fn check_server_health(server: &str) -> ServerHealth {
         }
     };
 
-    let started_at = Instant::now();
-    let versions_url = format!("https://{server}/_matrix/client/versions");
-
-    let versions_response = match client.get(&versions_url).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return ServerHealth {
-                server,
-                status: status_from_request_error(&error),
-                public_rooms_available: false,
-                latency_ms: Some(started_at.elapsed().as_millis()),
-                reason: Some(request_error_reason(&error)),
-            };
-        }
-    };
-
-    if !versions_response.status().is_success() {
-        return ServerHealth {
-            server,
-            status: ServerStatus::Unknown,
-            public_rooms_available: false,
-            latency_ms: Some(started_at.elapsed().as_millis()),
-            reason: Some(format!(
-                "versions endpoint returned {}",
-                versions_response.status()
-            )),
-        };
-    }
-
     let public_rooms_url = format!("https://{server}/_matrix/client/v3/publicRooms");
+    let started_at = Instant::now();
     let public_rooms_response = client
         .get(&public_rooms_url)
         .query(&PublicRoomsQuery {
