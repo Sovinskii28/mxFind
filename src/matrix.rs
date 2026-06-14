@@ -22,6 +22,19 @@ struct PublicRoomsQuery<'a> {
     since: Option<&'a str>,
 }
 
+#[derive(Serialize)]
+struct PublicRoomsSearchRequest<'a> {
+    limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<&'a str>,
+    filter: PublicRoomsFilter<'a>,
+}
+
+#[derive(Serialize)]
+struct PublicRoomsFilter<'a> {
+    generic_search_term: &'a str,
+}
+
 #[derive(Deserialize)]
 struct PublicRoom {
     room_id: String,
@@ -68,6 +81,10 @@ impl PublicRoomsError {
             kind,
             detail: detail.into(),
         }
+    }
+
+    pub fn kind(&self) -> PublicRoomsErrorKind {
+        self.kind
     }
 }
 
@@ -138,6 +155,76 @@ pub async fn fetch_public_rooms(server: &str) -> Result<Vec<Room>, PublicRoomsEr
         next_batch = Some(batch);
     }
 
+    Ok(rooms)
+}
+
+pub async fn fetch_public_rooms_search(
+    server: &str,
+    search_term: &str,
+    result_limit: usize,
+) -> Result<Vec<Room>, PublicRoomsError> {
+    let search_term = search_term.trim();
+
+    if result_limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    if search_term.is_empty() {
+        return fetch_public_rooms(server).await;
+    }
+
+    let client = matrix_http_client(Duration::from_secs(10))?;
+    let url = format!("https://{server}/_matrix/client/v3/publicRooms");
+    let mut rooms = Vec::new();
+    let mut next_batch = None;
+
+    while rooms.len() < result_limit {
+        let remaining = result_limit - rooms.len();
+        let limit = PUBLIC_ROOMS_PAGE_LIMIT.min(remaining as u64);
+        let request = PublicRoomsSearchRequest {
+            limit,
+            since: next_batch.as_deref(),
+            filter: PublicRoomsFilter {
+                generic_search_term: search_term,
+            },
+        };
+
+        let response = client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_http_status(status));
+        }
+
+        let response = response
+            .json::<PublicRoomsResponse>()
+            .await
+            .map_err(|error| {
+                PublicRoomsError::new(PublicRoomsErrorKind::InvalidResponse, error.to_string())
+            })?;
+
+        rooms.extend(response.chunk.into_iter().map(|room| Room {
+            room_id: room.room_id,
+            name: room.name,
+            topic: room.topic,
+            canonical_alias: room.canonical_alias,
+            num_joined_members: room.num_joined_members,
+            server: server.to_string(),
+        }));
+
+        let Some(batch) = response.next_batch else {
+            break;
+        };
+
+        next_batch = Some(batch);
+    }
+
+    rooms.truncate(result_limit);
     Ok(rooms)
 }
 
@@ -413,6 +500,9 @@ fn classify_http_status(status: StatusCode) -> PublicRoomsError {
     let kind = match status {
         StatusCode::NOT_FOUND => PublicRoomsErrorKind::NotFound,
         StatusCode::UNAUTHORIZED => PublicRoomsErrorKind::Unauthorized,
+        StatusCode::BAD_REQUEST | StatusCode::METHOD_NOT_ALLOWED => {
+            PublicRoomsErrorKind::InvalidResponse
+        }
         _ => PublicRoomsErrorKind::NetworkError,
     };
 

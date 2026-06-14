@@ -60,6 +60,71 @@ pub async fn init_db(pool: &SqlitePool) -> anyhow::Result<()> {
     .await
     .context("failed to create rooms unique index")?;
 
+    query(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS rooms_fts USING fts5(
+            room_id,
+            canonical_alias,
+            name,
+            topic,
+            content='rooms',
+            content_rowid='id'
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create rooms FTS index")?;
+
+    query(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS rooms_fts_after_insert
+        AFTER INSERT ON rooms
+        BEGIN
+            INSERT INTO rooms_fts(rowid, room_id, canonical_alias, name, topic)
+            VALUES (new.id, new.room_id, new.canonical_alias, new.name, new.topic);
+        END
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create rooms FTS insert trigger")?;
+
+    query(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS rooms_fts_after_delete
+        AFTER DELETE ON rooms
+        BEGIN
+            INSERT INTO rooms_fts(rooms_fts, rowid, room_id, canonical_alias, name, topic)
+            VALUES ('delete', old.id, old.room_id, old.canonical_alias, old.name, old.topic);
+        END
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create rooms FTS delete trigger")?;
+
+    query(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS rooms_fts_after_update
+        AFTER UPDATE ON rooms
+        BEGIN
+            INSERT INTO rooms_fts(rooms_fts, rowid, room_id, canonical_alias, name, topic)
+            VALUES ('delete', old.id, old.room_id, old.canonical_alias, old.name, old.topic);
+            INSERT INTO rooms_fts(rowid, room_id, canonical_alias, name, topic)
+            VALUES (new.id, new.room_id, new.canonical_alias, new.name, new.topic);
+        END
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create rooms FTS update trigger")?;
+
+    query("INSERT INTO rooms_fts(rooms_fts) VALUES ('rebuild')")
+        .execute(pool)
+        .await
+        .context("failed to rebuild rooms FTS index")?;
+
     Ok(())
 }
 
@@ -222,8 +287,38 @@ pub async fn search_rooms(
         return Ok(Vec::new());
     }
 
-    let pattern = format!("%{}%", search_query.to_lowercase());
     let limit = i64::try_from(limit).context("search limit does not fit into SQLite integer")?;
+
+    if let Some(fts_query) = fts_query(search_query) {
+        let fts_rows = query(
+            r#"
+            SELECT
+                rooms.room_id,
+                rooms.canonical_alias,
+                rooms.name,
+                rooms.topic,
+                rooms.num_joined_members,
+                rooms.server
+            FROM rooms_fts
+            JOIN rooms ON rooms.id = rooms_fts.rowid
+            WHERE rooms_fts MATCH ?
+            ORDER BY coalesce(rooms.num_joined_members, 0) DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(&fts_query)
+        .bind(limit)
+        .fetch_all(pool)
+        .await;
+
+        if let Ok(rows) = fts_rows {
+            if !rows.is_empty() {
+                return rows.into_iter().map(room_from_row).collect();
+            }
+        }
+    }
+
+    let pattern = format!("%{}%", search_query);
     let rows = query(
         r#"
         SELECT
@@ -235,10 +330,10 @@ pub async fn search_rooms(
             server
         FROM rooms
         WHERE
-            lower(room_id) LIKE ?
-            OR lower(coalesce(canonical_alias, '')) LIKE ?
-            OR lower(coalesce(name, '')) LIKE ?
-            OR lower(coalesce(topic, '')) LIKE ?
+            room_id LIKE ? COLLATE NOCASE
+            OR coalesce(canonical_alias, '') LIKE ? COLLATE NOCASE
+            OR coalesce(name, '') LIKE ? COLLATE NOCASE
+            OR coalesce(topic, '') LIKE ? COLLATE NOCASE
         ORDER BY coalesce(num_joined_members, 0) DESC
         LIMIT ?
         "#,
@@ -253,6 +348,20 @@ pub async fn search_rooms(
     .context("failed to search rooms in local database")?;
 
     rows.into_iter().map(room_from_row).collect()
+}
+
+fn fts_query(search_query: &str) -> Option<String> {
+    let tokens = search_query
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .map(fts_token)
+        .collect::<Vec<_>>();
+
+    (!tokens.is_empty()).then(|| tokens.join(" AND "))
+}
+
+fn fts_token(token: &str) -> String {
+    format!("\"{}\"*", token.replace('"', "\"\""))
 }
 
 #[allow(dead_code)]
@@ -305,7 +414,7 @@ mod tests {
 
     use sqlx::query_scalar;
 
-    use super::{init_db, open_db, prune_stale_rooms, upsert_rooms};
+    use super::{init_db, open_db, prune_stale_rooms, search_rooms, upsert_rooms};
     use crate::models::Room;
 
     #[tokio::test]
@@ -341,6 +450,54 @@ mod tests {
         assert_eq!(room_count(&pool, "!fresh:matrix.org").await, 1);
         assert_eq!(room_count(&pool, "!stale:matrix.org").await, 0);
         assert_eq!(room_count(&pool, "!offline:offline.org").await, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn search_rooms_matches_alias_tokens_with_punctuation() {
+        let db_path = test_db_path("search_rooms_matches_alias_tokens_with_punctuation");
+        let pool = open_db(&db_path).await.expect("test db should open");
+        init_db(&pool).await.expect("schema should initialize");
+
+        let mut room = test_room("!rust:matrix.org", "matrix.org");
+        room.canonical_alias = Some("#rust:matrix.org".to_string());
+        room.name = Some("Rust Matrix".to_string());
+        room.num_joined_members = Some(42);
+        upsert_rooms(&pool, &[room])
+            .await
+            .expect("room should insert");
+
+        let matches = search_rooms(&pool, "#rust:matrix.org", 10)
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].room_id, "!rust:matrix.org");
+
+        pool.close().await;
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn search_rooms_keeps_substring_fallback() {
+        let db_path = test_db_path("search_rooms_keeps_substring_fallback");
+        let pool = open_db(&db_path).await.expect("test db should open");
+        init_db(&pool).await.expect("schema should initialize");
+
+        let mut room = test_room("!rust:matrix.org", "matrix.org");
+        room.name = Some("Rust Matrix".to_string());
+        upsert_rooms(&pool, &[room])
+            .await
+            .expect("room should insert");
+
+        let matches = search_rooms(&pool, "ust", 10)
+            .await
+            .expect("search should succeed");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].room_id, "!rust:matrix.org");
 
         pool.close().await;
         let _ = std::fs::remove_file(db_path);

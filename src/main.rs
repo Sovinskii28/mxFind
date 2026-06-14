@@ -36,9 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            print_banner();
-            println!();
-            println!("Run `mxfind --help` to see available commands.");
+            run_tui_command(None, None, false).await?;
         }
 
         Some(Command::Index {
@@ -178,27 +176,38 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Some(Command::Tui { db, config, local }) => {
-            print_banner();
-            println!();
-
-            let config = load_config(config.as_deref())?;
-
-            if local {
-                let db_path = match db {
-                    Some(path) => path,
-                    None => default_db_path()?,
-                };
-
-                if !db_path.exists() {
-                    anyhow::bail!("Local database not found. Run `mxfind index` first.");
-                }
-
-                let pool = open_db(&db_path).await?;
-                tui::run_local(pool, config.servers).await?;
-            } else {
-                tui::run_live(config.servers).await?;
-            }
+            run_tui_command(db, config, local).await?;
         }
+    }
+
+    Ok(())
+}
+
+async fn run_tui_command(
+    db: Option<std::path::PathBuf>,
+    config: Option<std::path::PathBuf>,
+    local: bool,
+) -> anyhow::Result<()> {
+    print_banner();
+    println!();
+
+    let config = load_config(config.as_deref())?;
+
+    if local {
+        let db_path = match db {
+            Some(path) => path,
+            None => default_db_path()?,
+        };
+
+        if !db_path.exists() {
+            anyhow::bail!("Local database not found. Run `mxfind index` first.");
+        }
+
+        let pool = open_db(&db_path).await?;
+        init_db(&pool).await?;
+        tui::run_local(pool, config.servers).await?;
+    } else {
+        tui::run_live(config.servers).await?;
     }
 
     Ok(())
@@ -225,6 +234,7 @@ async fn search_local_rooms(
     }
 
     let pool = open_db(db_path).await?;
+    init_db(&pool).await?;
     search_rooms(&pool, query, limit).await
 }
 

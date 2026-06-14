@@ -1,7 +1,8 @@
 use std::io::{self, Stdout};
+use std::time::Duration;
 
 use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -13,15 +14,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use sqlx::SqlitePool;
+use tokio::sync::mpsc;
 
 use crate::db::search_rooms;
-use crate::matrix::fetch_public_rooms;
+use crate::matrix::{fetch_public_rooms, fetch_public_rooms_search, PublicRoomsErrorKind};
 use crate::models::{Room, RoomHealth, RoomStatus, ServerHealth, ServerStatus};
 use crate::room_status::check_rooms_status;
 use crate::search::{dedup_rooms, filter_rooms};
 use crate::server_status::check_servers_status;
 
 const TUI_RESULT_LIMIT: usize = 50;
+const TUI_TICK_RATE: Duration = Duration::from_millis(120);
+const SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 pub struct AppState {
     pub query: String,
@@ -36,6 +40,13 @@ pub struct AppState {
     search_mode: SearchMode,
     has_searched: bool,
     message: Option<String>,
+    is_loading: bool,
+    loading_label: Option<String>,
+    status_loading: bool,
+    spinner_frame: usize,
+    next_search_id: u64,
+    active_search_id: Option<u64>,
+    active_status_id: Option<u64>,
 }
 
 impl AppState {
@@ -53,6 +64,13 @@ impl AppState {
             search_mode,
             has_searched: false,
             message: None,
+            is_loading: false,
+            loading_label: None,
+            status_loading: false,
+            spinner_frame: 0,
+            next_search_id: 0,
+            active_search_id: None,
+            active_status_id: None,
         }
     }
 }
@@ -67,6 +85,23 @@ enum FocusedPanel {
 enum SearchMode {
     Live,
     Local,
+}
+
+struct SearchOutcome {
+    id: u64,
+    query: String,
+    result: anyhow::Result<Vec<Room>>,
+}
+
+struct StatusOutcome {
+    id: u64,
+    server_statuses: Vec<ServerHealth>,
+    room_statuses: std::collections::HashMap<String, RoomHealth>,
+}
+
+enum TuiOutcome {
+    Search(SearchOutcome),
+    Status(StatusOutcome),
 }
 
 pub async fn run_live(servers: Vec<String>) -> anyhow::Result<()> {
@@ -121,8 +156,13 @@ async fn run_loop(
     server_statuses: Vec<ServerHealth>,
 ) -> anyhow::Result<()> {
     let mut state = AppState::new(server_statuses, backend.search_mode());
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel();
 
     while !state.should_quit {
+        while let Ok(outcome) = task_rx.try_recv() {
+            apply_tui_outcome(&mut state, outcome, &servers, &task_tx);
+        }
+
         // Draw the full TUI frame: layout, server status, search, help, results, and details.
         terminal.draw(|frame| {
             let area = frame.area();
@@ -145,18 +185,8 @@ async fn run_loop(
                 search_mode_label(state.search_mode),
                 state.query
             ))
-                .block(Block::default().borders(Borders::ALL));
-            let help_text = match &state.message {
-                Some(message) => {
-                    format!(
-                        "Type to search | Enter search | r refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit | {message}"
-                    )
-                }
-                None => {
-                    "Type to search | Enter search | r refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit"
-                        .to_string()
-                }
-            };
+            .block(Block::default().borders(Borders::ALL));
+            let help_text = help_text(&state);
             let help = Paragraph::new(help_text).block(Block::default().borders(Borders::ALL));
             let content_chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -178,10 +208,16 @@ async fn run_loop(
             // End of full TUI frame drawing.
         })?;
 
-        match event::read()? {
-            Event::Key(key) => handle_key(&mut state, key.code, &backend, &servers).await?,
-            Event::Resize(_, _) => terminal.clear()?,
-            _ => {}
+        if event::poll(TUI_TICK_RATE)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    handle_key(&mut state, key, &backend, &servers, &task_tx).await?
+                }
+                Event::Resize(_, _) => terminal.clear()?,
+                _ => {}
+            }
+        } else if state.is_loading || state.status_loading {
+            state.spinner_frame = state.spinner_frame.wrapping_add(1);
         }
     }
 
@@ -190,12 +226,19 @@ async fn run_loop(
 
 async fn handle_key(
     state: &mut AppState,
-    code: KeyCode,
+    key: KeyEvent,
     backend: &SearchBackend,
     servers: &[String],
+    task_tx: &mpsc::UnboundedSender<TuiOutcome>,
 ) -> anyhow::Result<()> {
-    match code {
+    match key.code {
         KeyCode::Esc => state.should_quit = true,
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.should_quit = true;
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            submit_status_refresh(state, servers, task_tx);
+        }
         KeyCode::Right => state.focused_panel = FocusedPanel::Details,
         KeyCode::Left => state.focused_panel = FocusedPanel::Results,
         KeyCode::Down => {
@@ -229,28 +272,15 @@ async fn handle_key(
             }
         }
         KeyCode::Enter => {
-            state.results = search_tui_rooms(backend, servers, &state.query).await?;
-            state.server_statuses =
-                check_servers_status(tui_servers_to_check(servers, &state.results)).await;
-            state.room_statuses = check_rooms_status(&state.results).await;
-            state.selected = 0;
-            state.results_offset = 0;
-            state.details_scroll = 0;
-            state.focused_panel = FocusedPanel::Results;
-            state.has_searched = true;
-            state.message = Some("Search submitted".to_string());
+            if state.query.trim().is_empty() {
+                submit_status_refresh(state, servers, task_tx);
+            } else {
+                submit_search(state, backend, servers, task_tx);
+            }
         }
         KeyCode::Backspace => {
             state.query.pop();
             state.message = None;
-        }
-        KeyCode::Char('q') if state.query.is_empty() => state.should_quit = true,
-        KeyCode::Char('r') if state.query.is_empty() => {
-            state.message = Some("Refreshing statuses...".to_string());
-            state.server_statuses =
-                check_servers_status(tui_servers_to_check(servers, &state.results)).await;
-            state.room_statuses = check_rooms_status(&state.results).await;
-            state.message = Some("Statuses refreshed".to_string());
         }
         KeyCode::Char(character) => {
             state.query.push(character);
@@ -262,6 +292,7 @@ async fn handle_key(
     Ok(())
 }
 
+#[derive(Clone)]
 enum SearchBackend {
     Live,
     Local(SqlitePool),
@@ -274,6 +305,117 @@ impl SearchBackend {
             Self::Local(_) => SearchMode::Local,
         }
     }
+}
+
+fn submit_search(
+    state: &mut AppState,
+    backend: &SearchBackend,
+    servers: &[String],
+    task_tx: &mpsc::UnboundedSender<TuiOutcome>,
+) {
+    let query = state.query.trim().to_string();
+
+    state.next_search_id = state.next_search_id.wrapping_add(1);
+    let id = state.next_search_id;
+    state.active_search_id = Some(id);
+    state.active_status_id = None;
+    state.status_loading = false;
+    state.is_loading = true;
+    state.loading_label = Some(format!("Searching for \"{query}\"..."));
+    state.spinner_frame = 0;
+    state.has_searched = true;
+    state.message = None;
+
+    let backend = backend.clone();
+    let servers = servers.to_vec();
+    let sender = task_tx.clone();
+
+    tokio::spawn(async move {
+        let result = search_tui_rooms(&backend, &servers, &query).await;
+        let _ = sender.send(TuiOutcome::Search(SearchOutcome { id, query, result }));
+    });
+}
+
+fn submit_status_refresh(
+    state: &mut AppState,
+    servers: &[String],
+    task_tx: &mpsc::UnboundedSender<TuiOutcome>,
+) {
+    state.next_search_id = state.next_search_id.wrapping_add(1);
+    let id = state.next_search_id;
+    state.active_status_id = Some(id);
+    state.status_loading = true;
+    state.spinner_frame = 0;
+    state.message = Some("Refreshing statuses...".to_string());
+
+    let servers_to_check = tui_servers_to_check(servers, &state.results);
+    let rooms = state.results.clone();
+    let sender = task_tx.clone();
+
+    tokio::spawn(async move {
+        let server_statuses = check_servers_status(servers_to_check).await;
+        let room_statuses = check_rooms_status(&rooms).await;
+        let _ = sender.send(TuiOutcome::Status(StatusOutcome {
+            id,
+            server_statuses,
+            room_statuses,
+        }));
+    });
+}
+
+fn apply_tui_outcome(
+    state: &mut AppState,
+    outcome: TuiOutcome,
+    servers: &[String],
+    task_tx: &mpsc::UnboundedSender<TuiOutcome>,
+) {
+    match outcome {
+        TuiOutcome::Search(outcome) => {
+            if apply_search_outcome(state, outcome) {
+                submit_status_refresh(state, servers, task_tx);
+            }
+        }
+        TuiOutcome::Status(outcome) => apply_status_outcome(state, outcome),
+    }
+}
+
+fn apply_search_outcome(state: &mut AppState, outcome: SearchOutcome) -> bool {
+    if state.active_search_id != Some(outcome.id) {
+        return false;
+    }
+
+    state.active_search_id = None;
+    state.is_loading = false;
+    state.loading_label = None;
+
+    match outcome.result {
+        Ok(results) => {
+            state.results = results;
+            state.room_statuses.clear();
+            state.selected = 0;
+            state.results_offset = 0;
+            state.details_scroll = 0;
+            state.focused_panel = FocusedPanel::Results;
+            state.message = Some(format!("Search completed: {}", outcome.query));
+            true
+        }
+        Err(error) => {
+            state.message = Some(format!("Search failed: {error}"));
+            false
+        }
+    }
+}
+
+fn apply_status_outcome(state: &mut AppState, outcome: StatusOutcome) {
+    if state.active_status_id != Some(outcome.id) {
+        return;
+    }
+
+    state.active_status_id = None;
+    state.status_loading = false;
+    state.server_statuses = outcome.server_statuses;
+    state.room_statuses = outcome.room_statuses;
+    state.message = Some("Statuses refreshed".to_string());
 }
 
 async fn search_tui_rooms(
@@ -289,13 +431,14 @@ async fn search_tui_rooms(
 
 async fn search_live_rooms(servers: &[String], query: &str) -> anyhow::Result<Vec<Room>> {
     let mut requests = FuturesUnordered::new();
+    let query = query.trim();
 
     for server in servers
         .iter()
         .map(|server| server.trim())
         .filter(|server| !server.is_empty())
     {
-        requests.push(async move { fetch_public_rooms(server).await.unwrap_or_default() });
+        requests.push(async move { search_server_live_rooms(server, query).await });
     }
 
     let mut rooms = Vec::new();
@@ -314,6 +457,32 @@ async fn search_live_rooms(servers: &[String], query: &str) -> anyhow::Result<Ve
     rooms.truncate(TUI_RESULT_LIMIT);
 
     Ok(rooms)
+}
+
+async fn search_server_live_rooms(server: &str, query: &str) -> Vec<Room> {
+    match fetch_public_rooms_search(server, query, TUI_RESULT_LIMIT).await {
+        Ok(rooms) if !rooms.is_empty() => rooms,
+        Ok(_) => search_server_live_rooms_fallback(server, query).await,
+        Err(error)
+            if matches!(
+                error.kind(),
+                PublicRoomsErrorKind::InvalidResponse
+                    | PublicRoomsErrorKind::NetworkError
+                    | PublicRoomsErrorKind::NotFound
+                    | PublicRoomsErrorKind::Unauthorized
+            ) =>
+        {
+            search_server_live_rooms_fallback(server, query).await
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+async fn search_server_live_rooms_fallback(server: &str, query: &str) -> Vec<Room> {
+    fetch_public_rooms(server)
+        .await
+        .map(|rooms| filter_rooms(query, &rooms))
+        .unwrap_or_default()
 }
 
 fn search_mode_label(mode: SearchMode) -> &'static str {
@@ -361,7 +530,43 @@ fn servers_list(state: &AppState) -> List<'_> {
     List::new(items).block(Block::default().borders(Borders::ALL).title("Servers"))
 }
 
+fn help_text(state: &AppState) -> String {
+    if state.is_loading {
+        let label = state.loading_label.as_deref().unwrap_or("Working");
+        return format!(
+            "Type to edit query | Enter search | Ctrl+R refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit | {} {label}",
+            spinner(state)
+        );
+    }
+
+    if state.status_loading {
+        return format!(
+            "Type to search | Enter search | Ctrl+R refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit | {} Refreshing statuses...",
+            spinner(state)
+        );
+    }
+
+    match &state.message {
+        Some(message) => {
+            format!(
+                "Type to search | Enter search | Ctrl+R refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit | {message}"
+            )
+        }
+        None => {
+            "Type to search | Enter search | Ctrl+R refresh statuses | ←/→ panel | ↑/↓ scroll | Esc quit"
+                .to_string()
+        }
+    }
+}
+
 fn results_list(state: &AppState) -> List<'_> {
+    if state.is_loading {
+        let label = state.loading_label.as_deref().unwrap_or("Working");
+        return List::new(vec![ListItem::new(format!("{} {label}", spinner(state)))]).block(
+            panel_block("Results", state.focused_panel == FocusedPanel::Results),
+        );
+    }
+
     if !state.has_searched {
         return List::new(Vec::<ListItem>::new()).block(panel_block(
             "Results",
@@ -408,6 +613,10 @@ fn results_list(state: &AppState) -> List<'_> {
         )
 }
 
+fn spinner(state: &AppState) -> &'static str {
+    SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()]
+}
+
 fn room_details(state: &AppState) -> Paragraph<'_> {
     let Some(room) = state.results.get(state.selected) else {
         return Paragraph::new("Select a room").block(panel_block(
@@ -427,7 +636,7 @@ fn room_details(state: &AppState) -> Paragraph<'_> {
 
     Paragraph::new(format!(
         "{id}\n\nname: {name}\n\n\
-         room status: {room_status}\n\
+         room status: {room_status}\n\n\
          topic: {topic}\n\n\
          members: {members}\n\
          server: {}\n\
@@ -464,6 +673,7 @@ fn room_status_label_for_room<'a>(state: &'a AppState, room_id: &str) -> &'a str
         .room_statuses
         .get(room_id)
         .map(|health| room_status_label(health.status))
+        .or_else(|| state.status_loading.then_some("checking..."))
         .unwrap_or("not checked")
 }
 
